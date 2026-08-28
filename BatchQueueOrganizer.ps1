@@ -1140,8 +1140,14 @@ function Refresh-AsiList {
 }
 
 function Refresh-List {
-    param([hashtable]$PreserveSelection)
+    param([hashtable]$PreserveSelection, [switch]$PreserveViewport)
     if ($asiEditToggle.Checked) { Refresh-AsiList -PreserveSelection $PreserveSelection; return }
+    $preservedTopKey = ''
+    $preservedTopIndex = -1
+    if ($PreserveViewport -and $list.Items.Count -gt 0 -and $null -ne $list.TopItem) {
+        $preservedTopIndex = $list.TopItem.Index
+        if ($null -ne $list.TopItem.Tag) { $preservedTopKey = "$($list.TopItem.Tag.Game)|$($list.TopItem.Tag.Key)" }
+    }
     $list.BeginUpdate()
     $list.Items.Clear()
     $search = $searchBox.Text.Trim()
@@ -1190,11 +1196,26 @@ function Refresh-List {
     $summaryLabel.Text = "$visible visible | $assigned/$($script:State.Records.Count) assigned"
     $activeSetLabel.Text = if ($creationEditToggle.Checked -and $script:State.Game -ne 'All') { 'Editing the separate Creation List.' } else { "Viewing: $($script:State.SetName). ME3Tweaks activation is independent." }
     $list.EndUpdate()
+    $restoredTopItem = $null
+    if ($PreserveViewport -and $list.Items.Count -gt 0) {
+        if ($preservedTopKey) {
+            foreach ($item in $list.Items) {
+                if ("$($item.Tag.Game)|$($item.Tag.Key)" -eq $preservedTopKey) {
+                    $restoredTopItem = $item
+                    break
+                }
+            }
+        }
+        if ($null -eq $restoredTopItem -and $preservedTopIndex -ge 0) {
+            $restoredTopItem = $list.Items[[Math]::Min($preservedTopIndex, $list.Items.Count - 1)]
+        }
+    }
     if ($PreserveSelection -and $list.SelectedItems.Count -gt 0) {
         $list.SelectedItems[0].Focused = $true
-        $list.SelectedItems[0].EnsureVisible()
+        if ($null -eq $restoredTopItem) { $list.SelectedItems[0].EnsureVisible() }
         $list.Focus()
     }
+    if ($null -ne $restoredTopItem) { $list.TopItem = $restoredTopItem }
 }
 
 function Load-SelectedGame {
@@ -1892,9 +1913,11 @@ $assignButton.add_Click({
     if ($list.SelectedItems.Count -eq 0) { return }
     if ($script:State.Game -eq 'All') { Remove-MissingModsFromAll; return }
     $records = @($list.SelectedItems | ForEach-Object { $_.Tag })
+    $selectedKeys = @{}
+    foreach ($record in $records) { $selectedKeys[$record.Key] = $true }
     $target = if ($targetBox.SelectedIndex -le 0) { $null } else { [Nullable[int]]$targetBox.SelectedItem.Stage }
     Set-RecordTarget -State $script:State -Records $records -Target $target
-    Refresh-List
+    Refresh-List -PreserveSelection $selectedKeys -PreserveViewport
 })
 $newQueueButton.add_Click({ New-ManagedQueue })
 $deleteQueueButton.add_Click({ Remove-FilteredQueue })
