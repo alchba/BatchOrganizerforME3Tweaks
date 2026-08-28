@@ -14,6 +14,7 @@ The Organizer does not install game mods itself. It creates and manages Batch In
 - per-queue ASI plugin selection
 - queue ordering by buttons, drag and drop, or Mount ID baseline
 - requirement, compatibility-target, and declared-incompatibility checks
+- direct Nexus links read from each mod's `modsite` metadata
 - missing-mod cleanup across Organizer-managed sets
 - restore-before-install settings
 - automatic timestamped backups and a Backup Manager

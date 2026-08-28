@@ -330,7 +330,7 @@ function Get-ModFacts {
 
     $path = Join-Path $ModsRoot $RelativePath
     if (-not (Test-Path -LiteralPath $path)) {
-        return [pscustomobject]@{ Exists = $false; Provided = @(); Required = @(); Conditional = @(); Incompatible = @(); Description = ''; MountIds = @() }
+        return [pscustomobject]@{ Exists = $false; Provided = @(); Required = @(); Conditional = @(); Incompatible = @(); Description = ''; ModSite = ''; MountIds = @() }
     }
 
     $text = Get-Content -LiteralPath $path -Raw -Encoding UTF8
@@ -363,6 +363,16 @@ function Get-ModFacts {
     $description = [regex]::Replace($description, '(?i)<br\s*/?>', "`r`n")
     $description = [regex]::Replace($description, '<[^>]+>', '')
     $description = [System.Net.WebUtility]::HtmlDecode($description).Trim()
+    $modSite = ''
+    if ($text -match '(?im)^\s*modsite\s*=\s*(.+?)\s*$') {
+        $candidate = [System.Net.WebUtility]::HtmlDecode($matches[1]).Trim().Trim('"').Trim("'")
+        [Uri]$parsedUri = $null
+        if ([Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$parsedUri) -and
+            $parsedUri.Scheme -in @('http', 'https') -and
+            ($parsedUri.DnsSafeHost -eq 'nexusmods.com' -or $parsedUri.DnsSafeHost.EndsWith('.nexusmods.com', [StringComparison]::OrdinalIgnoreCase))) {
+            $modSite = $parsedUri.AbsoluteUri
+        }
+    }
     $mountIds = [System.Collections.Generic.HashSet[int]]::new()
     $modRoot = Split-Path $path -Parent
     if ($RelativePath -like 'LE1\*') {
@@ -387,6 +397,7 @@ function Get-ModFacts {
         Conditional = @($conditional | Sort-Object)
         Incompatible = @($incompatible | Sort-Object)
         Description = $description
+        ModSite = $modSite
         MountIds = @($mountIds | Sort-Object)
     }
 }
@@ -885,12 +896,37 @@ $asiSelectAllButton = [System.Windows.Forms.Button]@{ Text = 'Select all ASI plu
 $asiClearAllButton = [System.Windows.Forms.Button]@{ Text = 'Clear ASI plugins'; Left = 212; Top = 125; Width = 190; Height = 32; Visible = $false }
 $asiModeHint = [System.Windows.Forms.Label]@{ Text = 'Select a specific queue above, then toggle its ASI plugins in the list.'; Left = 12; Top = 170; Width = 390; Height = 55; Visible = $false }
 $dependencyLabel = [System.Windows.Forms.Label]@{ Text = 'Details'; Left = 12; Top = 440; AutoSize = $true }
-$dependencyBox = [System.Windows.Forms.TextBox]@{ Left = 12; Top = 465; Width = 390; Height = 175; Multiline = $true; ReadOnly = $true; ScrollBars = 'Vertical' }
-$hint = [System.Windows.Forms.Label]@{ Text = 'Use Ctrl or Shift to select multiple mods.'; Left = 12; Top = 655; Width = 390; Height = 40 }
-$details.Controls.AddRange(@($selectedLabel, $pathLabel, $creationToggle, $targetLabel, $targetBox, $assignButton, $moveUpButton, $moveDownButton, $mountOrderButton, $newQueueButton, $deleteQueueButton, $backupButton, $restoreBeforeInstallToggle, $asiSelectAllButton, $asiClearAllButton, $asiModeHint, $dependencyLabel, $dependencyBox, $hint))
+$dependencyBox = [System.Windows.Forms.TextBox]@{ Left = 12; Top = 465; Width = 390; Height = 145; Multiline = $true; ReadOnly = $true; ScrollBars = 'Vertical' }
+$nexusLabel = [System.Windows.Forms.Label]@{ Text = 'Nexus:'; Left = 12; Top = 623; AutoSize = $true }
+$nexusLink = [System.Windows.Forms.LinkLabel]@{ Text = ''; Left = 62; Top = 620; Width = 340; Height = 22; AutoEllipsis = $true; LinkBehavior = 'HoverUnderline' }
+$hint = [System.Windows.Forms.Label]@{ Text = 'Use Ctrl or Shift to select multiple mods.'; Left = 12; Top = 650; Width = 390; Height = 40 }
+$details.Controls.AddRange(@($selectedLabel, $pathLabel, $creationToggle, $targetLabel, $targetBox, $assignButton, $moveUpButton, $moveDownButton, $mountOrderButton, $newQueueButton, $deleteQueueButton, $backupButton, $restoreBeforeInstallToggle, $asiSelectAllButton, $asiClearAllButton, $asiModeHint, $dependencyLabel, $dependencyBox, $nexusLabel, $nexusLink, $hint))
 $split.Panel2.Controls.Add($details)
 $form.Controls.Add($split)
 $form.Controls.Add($top)
+
+function Set-NexusLink {
+    param([string]$Url)
+
+    $nexusLink.Text = ''
+    $nexusLink.Tag = $null
+    if (-not [string]::IsNullOrWhiteSpace($Url)) {
+        $nexusLink.Text = $Url
+        $nexusLink.Tag = $Url
+    }
+}
+
+$nexusLink.add_LinkClicked({
+    $url = [string]$nexusLink.Tag
+    if ([string]::IsNullOrWhiteSpace($url)) { return }
+    try {
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new($url)
+        $startInfo.UseShellExecute = $true
+        [void][System.Diagnostics.Process]::Start($startInfo)
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Could not open the Nexus page.`r`n`r`n$($_.Exception.Message)", 'Open Nexus page', 'OK', 'Error')
+    }
+})
 
 function Get-MembershipText($record) {
     if ($record.Memberships.Count -eq 0) { return 'Unassigned' }
@@ -954,6 +990,7 @@ function Update-ModeControls {
         $selectedLabel.Text = if ($asiMode) { 'No ASI plugin selected' } else { 'No mod selected' }
         $pathLabel.Text = ''
         $dependencyBox.Text = ''
+        Set-NexusLink
     }
     Set-ListMode
 }
@@ -1667,10 +1704,11 @@ $list.add_SelectedIndexChanged({
     if ($list.SelectedItems.Count -eq 0) {
         $script:UpdatingCreationToggle = $true; $creationToggle.CheckState = 'Unchecked'; $script:UpdatingCreationToggle = $false
         $selectedLabel.Text = if ($asiEditToggle.Checked) { 'No ASI plugin selected' } else { 'No mod selected' }
-        $pathLabel.Text = ''; $dependencyBox.Text = ''; Update-AssignButtonState; return
+        $pathLabel.Text = ''; $dependencyBox.Text = ''; Set-NexusLink; Update-AssignButtonState; return
     }
     $records = @($list.SelectedItems | ForEach-Object { $_.Tag })
     if ($asiEditToggle.Checked) {
+        Set-NexusLink
         $selectedLabel.Text = if ($records.Count -eq 1) { $records[0].Name } else { "$($records.Count) ASI plugins selected" }
         if ($records.Count -eq 1) {
             $record = $records[0]
@@ -1695,6 +1733,7 @@ $list.add_SelectedIndexChanged({
     if ($records.Count -eq 1) {
         $record = $records[0]
         $pathLabel.Text = $record.Path
+        Set-NexusLink -Url $record.Facts.ModSite
         $targetBox.SelectedIndex = 0
         if ($null -ne $record.Target) {
             for ($index = 1; $index -lt $targetBox.Items.Count; $index++) {
@@ -1705,6 +1744,7 @@ $list.add_SelectedIndexChanged({
         $dependencyBox.Text = "Creation queue: $(if($record.InCreation){'Yes'}else{'No'})`r`nMount ID: $(if($record.Facts.MountIds.Count){$record.Facts.MountIds -join ', '}else{'None'})`r`nQueue order: $shownOrder`r`n`r`nStatus:`r`n$($record.Status)`r`n`r`nProvides:`r`n$(if($record.Facts.Provided.Count){$record.Facts.Provided -join "`r`n"}else{'None'})`r`n`r`nRequired dependencies:`r`n$(if($record.Facts.Required.Count){$record.Facts.Required -join "`r`n"}else{'None'})`r`n`r`nOptional or patch detection:`r`n$(if($record.Facts.Conditional.Count){$record.Facts.Conditional -join "`r`n"}else{'None'})`r`n`r`nIncompatible DLC:`r`n$(if($record.Facts.Incompatible.Count){$record.Facts.Incompatible -join "`r`n"}else{'None'})`r`n`r`nDescription:`r`n$(if($record.Facts.Description){$record.Facts.Description}else{'No description available.'})"
     } else {
         $pathLabel.Text = ''; $targetBox.SelectedIndex = 0
+        Set-NexusLink
         $dependencyBox.Text = 'The selected target queue will be applied to every selected mod.'
     }
 })
