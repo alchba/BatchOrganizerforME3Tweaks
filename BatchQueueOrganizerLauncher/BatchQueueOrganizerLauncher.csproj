@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>ME3TweaksBatchQueueOrganizer</AssemblyName>
+    <RootNamespace>ME3TweaksBatchQueueOrganizer</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>ME3TweaksBatchQueueOrganizer.ico</ApplicationIcon>
+    <DefineConstants Condition="'$(EmbedOrganizerAssets)' == 'true'">$(DefineConstants);DISTRIBUTION_BUILD</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(EmbedOrganizerAssets)' == 'true'">
+    <EmbeddedResource Include="..\BatchQueueOrganizer.ps1" LogicalName="BatchQueueOrganizer.ps1" />
+    <EmbeddedResource Include="ME3TweaksBatchQueueOrganizer.ico" LogicalName="ME3TweaksBatchQueueOrganizer.ico" />
+  </ItemGroup>
+</Project>

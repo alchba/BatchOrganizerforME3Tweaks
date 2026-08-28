@@ -1,0 +1,27 @@
+# User-specific Organizer data
+Organizer*.json
+
+# Distribution and compiled output
+distribute/
+**/bin/
+**/obj/
+**/publish/
+**/publish-*/
+**/distribution-publish/
+*.exe
+*.dll
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+*.zip
+
+# Visual Studio and editor state
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Operating-system files
+Thumbs.db
+Desktop.ini
+.DS_Store
