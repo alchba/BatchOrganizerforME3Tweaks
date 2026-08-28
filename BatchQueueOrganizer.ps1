@@ -1519,15 +1519,23 @@ function Show-BackupManager {
     [void](New-Item -ItemType Directory -Path $backupRoot -Force)
     $dialog = [System.Windows.Forms.Form]@{ Text = 'Organizer Backup Manager'; Width = 900; Height = 520; StartPosition = 'CenterParent'; MinimizeBox = $false; MaximizeBox = $false }
     if (Test-Path -LiteralPath $iconPath) { $dialog.Icon = [System.Drawing.Icon]::new($iconPath) }
-    $backupList = [System.Windows.Forms.ListView]@{ Left = 12; Top = 12; Width = 858; Height = 410; View = 'Details'; FullRowSelect = $true; GridLines = $true; MultiSelect = $false }
+    $backupList = [System.Windows.Forms.ListView]@{ Left = 12; Top = 12; Width = 858; Height = 410; View = 'Details'; FullRowSelect = $true; GridLines = $true; MultiSelect = $true; HideSelection = $false }
     [void]$backupList.Columns.Add('Backup', 430)
     [void]$backupList.Columns.Add('Modified', 175)
     [void]$backupList.Columns.Add('Queue files', 95)
     [void]$backupList.Columns.Add('Size', 120)
-    $restoreButton = [System.Windows.Forms.Button]@{ Text = 'Restore selected'; Left = 12; Top = 435; Width = 180; Height = 32 }
-    $deleteBackupButton = [System.Windows.Forms.Button]@{ Text = 'Delete selected'; Left = 202; Top = 435; Width = 180; Height = 32 }
+    $restoreButton = [System.Windows.Forms.Button]@{ Text = 'Restore selected'; Left = 12; Top = 435; Width = 180; Height = 32; Enabled = $false }
+    $deleteBackupButton = [System.Windows.Forms.Button]@{ Text = 'Delete selected'; Left = 202; Top = 435; Width = 180; Height = 32; Enabled = $false }
+    $backupSelectionHint = [System.Windows.Forms.Label]@{ Text = 'Use Ctrl or Shift to select multiple backups.'; Left = 400; Top = 444; Width = 275; Height = 24 }
     $closeBackupButton = [System.Windows.Forms.Button]@{ Text = 'Close'; Left = 690; Top = 435; Width = 180; Height = 32 }
-    $dialog.Controls.AddRange(@($backupList, $restoreButton, $deleteBackupButton, $closeBackupButton))
+    $dialog.Controls.AddRange(@($backupList, $restoreButton, $deleteBackupButton, $backupSelectionHint, $closeBackupButton))
+
+    $updateBackupButtons = {
+        $selectionCount = $backupList.SelectedItems.Count
+        $restoreButton.Enabled = $selectionCount -eq 1
+        $deleteBackupButton.Enabled = $selectionCount -gt 0
+        $deleteBackupButton.Text = if ($selectionCount -gt 1) { "Delete selected ($selectionCount)" } else { 'Delete selected' }
+    }
 
     $refreshBackups = {
         $backupList.Items.Clear()
@@ -1541,11 +1549,13 @@ function Show-BackupManager {
             $item.Tag = $directory.FullName
             [void]$backupList.Items.Add($item)
         }
+        & $updateBackupButtons
     }
     & $refreshBackups
+    $backupList.add_SelectedIndexChanged({ & $updateBackupButtons })
 
     $restoreButton.add_Click({
-        if ($backupList.SelectedItems.Count -eq 0) { return }
+        if ($backupList.SelectedItems.Count -ne 1) { return }
         if ($script:State.Dirty) {
             [System.Windows.Forms.MessageBox]::Show('Save or reload current changes before restoring a backup.', 'ME3Tweaks Organizer', 'OK', 'Warning')
             return
@@ -1598,13 +1608,19 @@ function Show-BackupManager {
     })
     $deleteBackupButton.add_Click({
         if ($backupList.SelectedItems.Count -eq 0) { return }
-        $selectedDirectory = [string]$backupList.SelectedItems[0].Tag
-        $answer = [System.Windows.Forms.MessageBox]::Show("Permanently delete backup '$($backupList.SelectedItems[0].Text)'?`r`n`r`nThis cannot be undone.", 'Confirm backup deletion', 'YesNo', 'Warning')
+        $selectedItems = @($backupList.SelectedItems)
+        $selectionCount = $selectedItems.Count
+        $deleteDescription = if ($selectionCount -eq 1) { "backup '$($selectedItems[0].Text)'" } else { "$selectionCount selected backups" }
+        $answer = [System.Windows.Forms.MessageBox]::Show("Permanently delete $deleteDescription?`r`n`r`nThis cannot be undone.", 'Confirm backup deletion', 'YesNo', 'Warning')
         if ($answer -ne 'Yes') { return }
         $resolvedRoot = (Resolve-Path -LiteralPath $backupRoot).Path
-        $resolvedDirectory = (Resolve-Path -LiteralPath $selectedDirectory).Path
-        if ((Split-Path $resolvedDirectory -Parent) -ne $resolvedRoot) { throw "Refusing to delete a directory outside OrganizerBackups: $resolvedDirectory" }
-        [System.IO.Directory]::Delete($resolvedDirectory, $true)
+        $resolvedDirectories = [System.Collections.Generic.List[string]]::new()
+        foreach ($selectedItem in $selectedItems) {
+            $resolvedDirectory = (Resolve-Path -LiteralPath ([string]$selectedItem.Tag)).Path
+            if ((Split-Path $resolvedDirectory -Parent) -ne $resolvedRoot) { throw "Refusing to delete a directory outside OrganizerBackups: $resolvedDirectory" }
+            $resolvedDirectories.Add($resolvedDirectory)
+        }
+        foreach ($resolvedDirectory in $resolvedDirectories) { [System.IO.Directory]::Delete($resolvedDirectory, $true) }
         & $refreshBackups
     })
     $closeBackupButton.add_Click({ $dialog.Close() })
