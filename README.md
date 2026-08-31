@@ -1,10 +1,16 @@
 # ME3Tweaks Batch Queue Organizer
 
+Current version: **1.0.3**
+
+The planned graphical queue and dependency view is reserved for version **1.1.0**.
+
 ME3Tweaks Batch Queue Organizer is an independent Windows companion utility for organizing ME3Tweaks Batch Installer queues for Mass Effect Legendary Edition.
 
 It provides one interface for LE1, LE2, and LE3 working queues, global queue sets, separate Creation Lists, ASI plugin assignments, install order, dependency checks, declared incompatibilities, missing-mod cleanup, and backups.
 
 The Organizer does not install game mods itself. It creates and manages Batch Installer queue files that are used through [ME3Tweaks Mod Manager](https://me3tweaks.com/modmanager).
+
+Nexus Mods page: [ME3Tweaks Batch Queue Organizer](https://www.nexusmods.com/masseffectlegendaryedition/mods/3399)
 
 ## Features
 
@@ -12,8 +18,12 @@ The Organizer does not install game mods itself. It creates and manages Batch In
 - global queue sets with independent ME3Tweaks activation
 - separate editable Creation Lists
 - per-queue ASI plugin selection
-- queue ordering by buttons, drag and drop, or Mount ID baseline
+- queue creation, deletion, and safe renaming with automatic backups
+- queue ordering by buttons, drag and drop, Mount ID baseline, or dependency-aware auto-sort
+- safe auto-sort for one filtered queue plus an explicitly warned advanced mode across all working queues in a set
 - requirement, compatibility-target, and declared-incompatibility checks
+- local per-mod rules for additional requirements, load-after relationships, incompatibilities, and mods integrated into another mod
+- optional subject- or target-version conditions for local rules
 - direct Nexus links read from each mod's `modsite` metadata
 - missing-mod cleanup across Organizer-managed sets
 - restore-before-install settings
@@ -48,6 +58,10 @@ On first launch, select `ME3TweaksModManager.exe`. The Organizer uses that locat
 
 Running from source creates the local `Organizer*.json` files in the selected storage root. These files may contain local paths and personal queue configuration and must not be committed.
 
+Custom rules are stored in the versioned `OrganizerCustomRules.json` file. They apply to the selected game in every Organizer set and supplement the metadata from `moddesc.ini`; they never modify the installed mod's metadata. A rule may optionally be limited by the installed version of its selected mod or target mod. Without a version condition, it applies to every version.
+
+Supported local relationships are `Requires`, `LoadAfter`, `Incompatible`, and `IntegratedInto`. Dependency-aware auto-sort uses the ordering relationships together with native mod metadata. Local rules remain user-owned data and are intentionally not included in this repository.
+
 ## Optional Launcher Build
 
 Building is not required for reviewing the source code. To compile the launcher, install the .NET 9 SDK and run:
@@ -78,9 +92,11 @@ Most of the file size is the bundled .NET runtime, not the Organizer source. A f
 
 - Only Organizer-managed queues are edited or deleted.
 - Queues created directly in ME3Tweaks Mod Manager are treated as foreign and remain untouched.
-- Queue files are backed up before changes are written.
+- Queue files are backed up before changes are written, renamed, or deleted.
 - Creation Lists remain separate from global sets.
-- Validation is based on metadata declared by installed mods and cannot identify undeclared conflicts.
+- Normal auto-sort changes only the currently filtered working queue. Advanced auto-sort may move mods between every working queue in the selected game and set, while preserving each queue's mod count and leaving the Creation List untouched.
+- Dependencies and local load-order rules take priority during auto-sort. Mount ID and mod name provide the baseline where no dependency dictates the order; unresolved or cyclic cases remain marked for manual review.
+- Validation uses metadata declared by installed mods plus optional user-defined local rules. It cannot identify conflicts that are absent from both sources.
 
 ## Credits
 

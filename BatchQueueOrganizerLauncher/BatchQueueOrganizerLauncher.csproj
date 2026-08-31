@@ -5,6 +5,13 @@
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>ME3TweaksBatchQueueOrganizer</AssemblyName>
     <RootNamespace>ME3TweaksBatchQueueOrganizer</RootNamespace>
+    <Version>1.0.3</Version>
+    <AssemblyVersion>1.0.3.0</AssemblyVersion>
+    <FileVersion>1.0.3.0</FileVersion>
+    <InformationalVersion>1.0.3</InformationalVersion>
+    <Product>ME3Tweaks Batch Queue Organizer</Product>
+    <AssemblyTitle>ME3Tweaks Batch Queue Organizer</AssemblyTitle>
+    <Description>Portable organizer for ME3Tweaks Batch Installer queues</Description>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <ApplicationManifest>app.manifest</ApplicationManifest>

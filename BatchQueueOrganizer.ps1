@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:AppVersion = '1.0.3'
 
 $script:DefaultStageNames = [ordered]@{
     '0' = 'Creation Mods List'
@@ -24,6 +25,9 @@ $script:SettingsPath = Join-Path $script:StorageRoot 'OrganizerSettings.json'
 $script:QueueRegistryPath = Join-Path $script:StorageRoot 'OrganizerQueues.json'
 $script:SetRegistryPath = Join-Path $script:StorageRoot 'OrganizerSets.json'
 $script:RemovedMissingModsPath = Join-Path $script:StorageRoot 'OrganizerRemovedMissingMods.json'
+$script:CustomRulesPath = Join-Path $script:StorageRoot 'OrganizerCustomRules.json'
+$script:CustomRules = @()
+$script:CustomRulesLoadError = ''
 $script:QueueRegistry = if (Test-Path -LiteralPath $script:QueueRegistryPath) {
     try { @(Get-Content -LiteralPath $script:QueueRegistryPath -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { @() }
 } else { @() }
@@ -133,6 +137,87 @@ function Save-RemovedMissingMods {
     $entries = @($script:RemovedMissingMods | Sort-Object)
     [System.IO.File]::WriteAllText($script:RemovedMissingModsPath, (($entries | ConvertTo-Json) + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
 }
+
+function ConvertTo-NormalizedRuleIdentity {
+    param($Identity)
+
+    if ($null -eq $Identity) { $Identity = [pscustomobject]@{} }
+    $provided = @($Identity.providedDlc | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { ([string]$_).Trim() } | Sort-Object -Unique)
+    $nexusId = 0
+    if ($null -ne $Identity.nexusId) { [void][int]::TryParse([string]$Identity.nexusId, [ref]$nexusId) }
+    return [pscustomobject][ordered]@{
+        path = ([string]$Identity.path).Trim()
+        nexusId = $nexusId
+        providedDlc = $provided
+        name = ([string]$Identity.name).Trim()
+        version = ([string]$Identity.version).Trim()
+    }
+}
+
+function ConvertTo-NormalizedVersionCondition {
+    param($Condition)
+
+    $side = if ($null -ne $Condition -and [string]$Condition.side -eq 'Subject') { 'Subject' } else { 'Target' }
+    $operator = if ($null -ne $Condition) { [string]$Condition.operator } else { 'Any' }
+    if ($operator -notin @('Any', 'Equal', 'LessThan', 'LessOrEqual', 'GreaterThan', 'GreaterOrEqual')) { $operator = 'Any' }
+    $value = if ($null -ne $Condition) { ([string]$Condition.value).Trim() } else { '' }
+    if ([string]::IsNullOrWhiteSpace($value)) { $operator = 'Any'; $value = '' }
+    return [pscustomobject][ordered]@{
+        side = $side
+        operator = $operator
+        value = $value
+    }
+}
+
+function Load-CustomRules {
+    $script:CustomRulesLoadError = ''
+    $loadedRules = @()
+    if (Test-Path -LiteralPath $script:CustomRulesPath -PathType Leaf) {
+        try {
+            $document = Get-Content -LiteralPath $script:CustomRulesPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $loadedRules = if ($null -ne $document.rules) { @($document.rules) } else { @($document) }
+        } catch {
+            $script:CustomRulesLoadError = $_.Exception.Message
+            $loadedRules = @()
+        }
+    }
+    $normalized = [System.Collections.Generic.List[object]]::new()
+    foreach ($rule in $loadedRules) {
+        $game = ([string]$rule.game).ToUpperInvariant()
+        $relation = [string]$rule.relation
+        if ($game -notin @('LE1', 'LE2', 'LE3') -or $relation -notin @('Requires', 'LoadAfter', 'Incompatible', 'IntegratedInto')) { continue }
+        $id = [string]$rule.id
+        if ([string]::IsNullOrWhiteSpace($id)) { $id = [guid]::NewGuid().ToString('D') }
+        $createdUtc = [string]$rule.createdUtc
+        if ([string]::IsNullOrWhiteSpace($createdUtc)) { $createdUtc = [DateTime]::UtcNow.ToString('o') }
+        $normalized.Add([pscustomobject][ordered]@{
+            id = $id
+            game = $game
+            relation = $relation
+            subject = ConvertTo-NormalizedRuleIdentity $rule.subject
+            target = ConvertTo-NormalizedRuleIdentity $rule.target
+            versionCondition = ConvertTo-NormalizedVersionCondition $rule.versionCondition
+            note = ([string]$rule.note).Trim()
+            enabled = $rule.enabled -ne $false
+            createdUtc = $createdUtc
+        })
+    }
+    $script:CustomRules = @($normalized)
+}
+
+function Save-CustomRules {
+    if (-not [string]::IsNullOrWhiteSpace($script:CustomRulesLoadError)) {
+        throw "The existing custom rule file could not be read and will not be overwritten: $($script:CustomRulesLoadError)"
+    }
+    [void](New-Item -ItemType Directory -Path $script:StorageRoot -Force)
+    $document = [pscustomobject][ordered]@{
+        schemaVersion = 2
+        rules = @($script:CustomRules | Sort-Object game, relation, @{ Expression = { $_.subject.name } }, @{ Expression = { $_.target.name } })
+    }
+    [System.IO.File]::WriteAllText($script:CustomRulesPath, (($document | ConvertTo-Json -Depth 12) + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+}
+
+Load-CustomRules
 
 function Set-QueueRegistryEntry {
     param([string]$Game, [string]$SetId = 'default', [string]$SetName = 'Default', [int]$Order, [string]$Name, [string]$QueueName, [string]$FileName)
@@ -330,7 +415,7 @@ function Get-ModFacts {
 
     $path = Join-Path $ModsRoot $RelativePath
     if (-not (Test-Path -LiteralPath $path)) {
-        return [pscustomobject]@{ Exists = $false; Provided = @(); Required = @(); Conditional = @(); Incompatible = @(); Description = ''; ModSite = ''; MountIds = @() }
+        return [pscustomobject]@{ Exists = $false; Provided = @(); Required = @(); Conditional = @(); Incompatible = @(); Description = ''; ModSite = ''; NexusId = 0; ModVersion = ''; MountIds = @() }
     }
 
     $text = Get-Content -LiteralPath $path -Raw -Encoding UTF8
@@ -373,6 +458,13 @@ function Get-ModFacts {
             $modSite = $parsedUri.AbsoluteUri
         }
     }
+    $nexusId = 0
+    if ($text -match '(?im)^\s*nexuscode\s*=\s*(\d+)\s*$') {
+        $nexusId = [int]$matches[1]
+    } elseif ($modSite -match '(?i)/mods/(\d+)(?:/|$)') {
+        $nexusId = [int]$matches[1]
+    }
+    $modVersion = if ($text -match '(?im)^\s*modver\s*=\s*(.+?)\s*$') { $matches[1].Trim() } else { '' }
     $mountIds = [System.Collections.Generic.HashSet[int]]::new()
     $modRoot = Split-Path $path -Parent
     if ($RelativePath -like 'LE1\*') {
@@ -398,8 +490,150 @@ function Get-ModFacts {
         Incompatible = @($incompatible | Sort-Object)
         Description = $description
         ModSite = $modSite
+        NexusId = $nexusId
+        ModVersion = $modVersion
         MountIds = @($mountIds | Sort-Object)
     }
+}
+
+function Get-RecordRuleIdentity {
+    param($Record)
+
+    return [pscustomobject][ordered]@{
+        path = [string]$Record.Path
+        nexusId = [int]$Record.Facts.NexusId
+        providedDlc = @($Record.Facts.Provided)
+        name = [string]$Record.Name
+        version = [string]$Record.Facts.ModVersion
+    }
+}
+
+function Resolve-RuleIdentity {
+    param($State, $Identity)
+
+    if ($null -eq $State -or $null -eq $Identity) { return $null }
+    $records = @($State.Records.Values)
+    $path = ([string]$Identity.path).Trim()
+    if ($path) {
+        $match = @($records | Where-Object { $_.Path -ieq $path })
+        if ($match.Count -eq 1) { return $match[0] }
+    }
+    $provided = @($Identity.providedDlc | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    if ($provided.Count) {
+        $match = @($records | Where-Object {
+            $recordProvided = @($_.Facts.Provided)
+            @($provided | Where-Object { $recordProvided -icontains $_ }).Count -gt 0
+        })
+        if ($match.Count -eq 1) { return $match[0] }
+    }
+    $nexusId = 0
+    if ($null -ne $Identity.nexusId) { [void][int]::TryParse([string]$Identity.nexusId, [ref]$nexusId) }
+    if ($nexusId -gt 0) {
+        $match = @($records | Where-Object { [int]$_.Facts.NexusId -eq $nexusId })
+        if ($match.Count -eq 1) { return $match[0] }
+    }
+    $name = ([string]$Identity.name).Trim()
+    if ($name) {
+        $match = @($records | Where-Object { $_.Name -ieq $name })
+        if ($match.Count -eq 1) { return $match[0] }
+    }
+    return $null
+}
+
+function Get-RuleIdentityDisplayName {
+    param($Identity)
+    if ($null -eq $Identity) { return 'Unknown mod' }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Identity.name)) { return [string]$Identity.name }
+    if (@($Identity.providedDlc).Count) { return (@($Identity.providedDlc) -join ', ') }
+    if ([int]$Identity.nexusId -gt 0) { return "Nexus mod $($Identity.nexusId)" }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Identity.path)) { return [string]$Identity.path }
+    return 'Unknown mod'
+}
+
+function Compare-ModVersions {
+    param([string]$Left, [string]$Right)
+
+    $leftText = $Left.Trim().ToLowerInvariant() -replace '^v(?=\d)', ''
+    $rightText = $Right.Trim().ToLowerInvariant() -replace '^v(?=\d)', ''
+    if ($leftText -eq $rightText) { return 0 }
+    $leftNumbers = @([regex]::Matches($leftText, '\d+') | ForEach-Object { [long]$_.Value })
+    $rightNumbers = @([regex]::Matches($rightText, '\d+') | ForEach-Object { [long]$_.Value })
+    if (-not $leftNumbers.Count -or -not $rightNumbers.Count) {
+        return [Math]::Sign([string]::Compare($leftText, $rightText, [System.StringComparison]::OrdinalIgnoreCase))
+    }
+    $count = [Math]::Max($leftNumbers.Count, $rightNumbers.Count)
+    for ($index = 0; $index -lt $count; $index++) {
+        $leftPart = if ($index -lt $leftNumbers.Count) { $leftNumbers[$index] } else { 0 }
+        $rightPart = if ($index -lt $rightNumbers.Count) { $rightNumbers[$index] } else { 0 }
+        if ($leftPart -lt $rightPart) { return -1 }
+        if ($leftPart -gt $rightPart) { return 1 }
+    }
+    $leftSuffix = ([regex]::Replace($leftText, '[\d\s._-]+', '')).Trim()
+    $rightSuffix = ([regex]::Replace($rightText, '[\d\s._-]+', '')).Trim()
+    if (-not $leftSuffix -and $rightSuffix) { return 1 }
+    if ($leftSuffix -and -not $rightSuffix) { return -1 }
+    return [Math]::Sign([string]::Compare($leftSuffix, $rightSuffix, [System.StringComparison]::OrdinalIgnoreCase))
+}
+
+function Get-VersionConditionDisplayText {
+    param($Condition, [switch]$Compact)
+
+    $normalized = ConvertTo-NormalizedVersionCondition $Condition
+    if ($normalized.operator -eq 'Any') { return $(if ($Compact) { '' } else { 'Any version' }) }
+    $side = if ($normalized.side -eq 'Subject') { 'selected mod' } else { 'target' }
+    $operator = switch ($normalized.operator) {
+        'Equal' { '=' }
+        'LessThan' { '<' }
+        'LessOrEqual' { '<=' }
+        'GreaterThan' { '>' }
+        'GreaterOrEqual' { '>=' }
+    }
+    return "$side version $operator $($normalized.value)"
+}
+
+function Test-RuleVersionCondition {
+    param($Rule, $SubjectRecord, $TargetRecord)
+
+    $condition = ConvertTo-NormalizedVersionCondition $Rule.versionCondition
+    if ($condition.operator -eq 'Any') { return $true }
+    $record = if ($condition.side -eq 'Subject') { $SubjectRecord } else { $TargetRecord }
+    if ($null -eq $record -or [string]::IsNullOrWhiteSpace([string]$record.Facts.ModVersion)) { return $false }
+    $comparison = Compare-ModVersions -Left ([string]$record.Facts.ModVersion) -Right ([string]$condition.value)
+    $result = switch ($condition.operator) {
+        'Equal' { $comparison -eq 0 }
+        'LessThan' { $comparison -lt 0 }
+        'LessOrEqual' { $comparison -le 0 }
+        'GreaterThan' { $comparison -gt 0 }
+        'GreaterOrEqual' { $comparison -ge 0 }
+        default { $true }
+    }
+    return [bool]$result
+}
+
+function Get-ResolvedCustomRules {
+    param($State)
+
+    $resolved = [System.Collections.Generic.List[object]]::new()
+    foreach ($rule in @($script:CustomRules | Where-Object { $_.enabled -ne $false -and $_.game -eq $State.Game })) {
+        $subjectRecord = Resolve-RuleIdentity -State $State -Identity $rule.subject
+        if ($null -eq $subjectRecord) { continue }
+        $targetRecord = Resolve-RuleIdentity -State $State -Identity $rule.target
+        $versionCondition = ConvertTo-NormalizedVersionCondition $rule.versionCondition
+        $versionRecord = if ($versionCondition.side -eq 'Subject') { $subjectRecord } else { $targetRecord }
+        $versionKnown = $versionCondition.operator -eq 'Any' -or ($null -ne $versionRecord -and -not [string]::IsNullOrWhiteSpace([string]$versionRecord.Facts.ModVersion))
+        $applies = $versionCondition.operator -eq 'Any' -or ($versionKnown -and (Test-RuleVersionCondition -Rule $rule -SubjectRecord $subjectRecord -TargetRecord $targetRecord))
+        $resolved.Add([pscustomobject]@{
+            Rule = $rule
+            Subject = $subjectRecord
+            Target = $targetRecord
+            TargetName = Get-RuleIdentityDisplayName $rule.target
+            VersionConditionText = Get-VersionConditionDisplayText $rule.versionCondition -Compact
+            VersionConditionKnown = $versionKnown
+            ComparedVersion = $(if ($null -ne $versionRecord) { [string]$versionRecord.Facts.ModVersion } else { '' })
+            Applies = $applies
+        })
+    }
+    return @($resolved)
 }
 
 function Get-GameState {
@@ -568,6 +802,171 @@ function Get-AllOrganizerQueuedModKeys {
     return ,$keys
 }
 
+function Test-WorkingRecordComesFirst {
+    param($Earlier, $Later)
+    if ($null -eq $Earlier -or $null -eq $Later -or $null -eq $Earlier.Target -or $null -eq $Later.Target) { return $false }
+    return [int]$Earlier.Target -lt [int]$Later.Target -or
+        ([int]$Earlier.Target -eq [int]$Later.Target -and (Get-RecordQueueOrder $Earlier) -le (Get-RecordQueueOrder $Later))
+}
+
+function Test-CreationRecordComesFirst {
+    param($Earlier, $Later)
+    if ($null -eq $Earlier -or $null -eq $Later -or -not $Earlier.InCreation -or -not $Later.InCreation) { return $false }
+    return (Get-RecordCreationOrder $Earlier) -le (Get-RecordCreationOrder $Later)
+}
+
+function Get-AutoSortBaseline {
+    param([object[]]$Records)
+
+    return @($Records | Sort-Object `
+        @{ Expression = { if ($_.Facts.MountIds.Count) { 0 } else { 1 } } }, `
+        @{ Expression = { if ($_.Facts.MountIds.Count) { [int]($_.Facts.MountIds | Measure-Object -Minimum).Minimum } else { [int]::MaxValue } } }, `
+        @{ Expression = { [string]$_.Name } }, `
+        @{ Expression = { [int]$_.ReferenceOrder } })
+}
+
+function Add-AutoSortReviewReason {
+    param($Review, [string]$Key, [string]$Reason)
+    if (-not $Review.ContainsKey($Key)) {
+        $Review[$Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    }
+    [void]$Review[$Key].Add($Reason)
+}
+
+function Add-AutoSortEdge {
+    param($Prerequisites, $Dependents, [string]$BeforeKey, [string]$AfterKey)
+    if ($BeforeKey -eq $AfterKey -or -not $Prerequisites.ContainsKey($BeforeKey) -or -not $Prerequisites.ContainsKey($AfterKey)) { return }
+    if ($Prerequisites[$AfterKey].Add($BeforeKey)) { [void]$Dependents[$BeforeKey].Add($AfterKey) }
+}
+
+function Get-AutoSortPlan {
+    param($State, [object[]]$Records)
+
+    $nodes = @{}
+    $prerequisites = @{}
+    $dependents = @{}
+    $review = @{}
+    foreach ($record in $Records) {
+        $nodes[$record.Key] = $record
+        $prerequisites[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $dependents[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    }
+    $providers = @{}
+    foreach ($record in $State.Records.Values) {
+        foreach ($dlc in $record.Facts.Provided) {
+            if (-not $providers.ContainsKey($dlc)) { $providers[$dlc] = [System.Collections.Generic.List[object]]::new() }
+            $providers[$dlc].Add($record)
+        }
+    }
+
+    foreach ($record in $Records) {
+        foreach ($dlc in $record.Facts.Required) {
+            $candidates = @(if ($providers.ContainsKey($dlc)) { @($providers[$dlc] | Where-Object { $_.Key -ne $record.Key }) } else { @() })
+            if (-not $candidates.Count) { Add-AutoSortReviewReason $review $record.Key "Required mod is missing: $dlc"; continue }
+            $earlierOutside = @($candidates | Where-Object { -not $nodes.ContainsKey($_.Key) -and ($_.InCreation -or ($null -ne $_.Target -and (Test-WorkingRecordComesFirst -Earlier $_ -Later $record))) })
+            if ($earlierOutside.Count) { continue }
+            $inside = @(Get-AutoSortBaseline @($candidates | Where-Object { $nodes.ContainsKey($_.Key) }))
+            if ($inside.Count) {
+                Add-AutoSortEdge $prerequisites $dependents $inside[0].Key $record.Key
+                continue
+            }
+            $assignedLater = @($candidates | Where-Object { $null -ne $_.Target })
+            if ($assignedLater.Count) { Add-AutoSortReviewReason $review $record.Key "Required mod is outside this sort scope and currently later: $($assignedLater[0].Name)" }
+            else { Add-AutoSortReviewReason $review $record.Key "Required mod is unassigned: $($candidates[0].Name)" }
+        }
+
+        foreach ($dlc in $record.Facts.Conditional) {
+            $candidates = @(if ($providers.ContainsKey($dlc)) { @($providers[$dlc] | Where-Object { $_.Key -ne $record.Key -and ($null -ne $_.Target -or $_.InCreation) }) } else { @() })
+            foreach ($candidate in $candidates) {
+                if ($nodes.ContainsKey($candidate.Key)) {
+                    Add-AutoSortEdge $prerequisites $dependents $candidate.Key $record.Key
+                } elseif (-not $candidate.InCreation -and -not (Test-WorkingRecordComesFirst -Earlier $candidate -Later $record)) {
+                    Add-AutoSortReviewReason $review $record.Key "Compatibility target is outside this sort scope and currently later: $($candidate.Name)"
+                }
+            }
+        }
+
+        foreach ($resolvedRule in @($record.CustomRules)) {
+            if ($resolvedRule.Rule.relation -notin @('Requires', 'LoadAfter')) { continue }
+            if (-not $resolvedRule.VersionConditionKnown) {
+                Add-AutoSortReviewReason $review $record.Key "Local rule version is unknown: $($resolvedRule.TargetName)"
+                continue
+            }
+            if (-not $resolvedRule.Applies) { continue }
+            $candidate = $resolvedRule.Target
+            $isRequired = $resolvedRule.Rule.relation -eq 'Requires'
+            if ($null -eq $candidate) {
+                if ($isRequired) { Add-AutoSortReviewReason $review $record.Key "Local dependency is missing: $($resolvedRule.TargetName)" }
+                continue
+            }
+            if ($nodes.ContainsKey($candidate.Key)) {
+                Add-AutoSortEdge $prerequisites $dependents $candidate.Key $record.Key
+            } elseif ($candidate.InCreation) {
+                continue
+            } elseif ($null -ne $candidate.Target) {
+                if (-not (Test-WorkingRecordComesFirst -Earlier $candidate -Later $record)) {
+                    $label = if ($isRequired) { 'Local dependency' } else { 'Local load-after target' }
+                    Add-AutoSortReviewReason $review $record.Key "$label is outside this sort scope and currently later: $($candidate.Name)"
+                }
+            } elseif ($isRequired) {
+                Add-AutoSortReviewReason $review $record.Key "Local dependency is unassigned: $($candidate.Name)"
+            }
+        }
+    }
+
+    $baseline = @(Get-AutoSortBaseline $Records)
+    $baselineIndex = @{}
+    for ($index = 0; $index -lt $baseline.Count; $index++) { $baselineIndex[$baseline[$index].Key] = $index }
+    $indegree = @{}; foreach ($key in $nodes.Keys) { $indegree[$key] = $prerequisites[$key].Count }
+    $remaining = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($key in $nodes.Keys) { [void]$remaining.Add($key) }
+    $ordered = [System.Collections.Generic.List[object]]::new()
+    $cycleReported = $false
+
+    while ($remaining.Count) {
+        $ready = @($remaining | Where-Object { $indegree[$_] -le 0 } | Sort-Object `
+            @{ Expression = { if ($review.ContainsKey($_)) { 1 } else { 0 } } }, `
+            @{ Expression = { $baselineIndex[$_] } })
+        if (-not $ready.Count) {
+            $blockedNames = @($remaining | ForEach-Object { $nodes[$_].Name } | Sort-Object)
+            foreach ($key in @($remaining)) { Add-AutoSortReviewReason $review $key "Dependency cycle or cycle-blocked chain: $($blockedNames -join ', ')" }
+            $ready = @($remaining | Sort-Object @{ Expression = { $baselineIndex[$_] } } | Select-Object -First 1)
+            $indegree[$ready[0]] = 0
+            $cycleReported = $true
+        }
+        $key = [string]$ready[0]
+        [void]$remaining.Remove($key)
+        $ordered.Add($nodes[$key])
+        foreach ($dependentKey in $dependents[$key]) { $indegree[$dependentKey] = [int]$indegree[$dependentKey] - 1 }
+    }
+
+    return [pscustomobject]@{
+        Ordered = @($ordered)
+        Review = $review
+        EdgeCount = @($prerequisites.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+        CycleDetected = $cycleReported
+    }
+}
+
+function Clear-AutoSortReview {
+    param($State, [object[]]$Records = @())
+    if (-not $State) { return }
+    $recordsToClear = if ($Records.Count) { @($Records) } else { @($State.Records.Values) }
+    foreach ($record in $recordsToClear) {
+        $record | Add-Member -NotePropertyName AutoSortReview -NotePropertyValue @() -Force
+    }
+}
+
+function Set-AutoSortReview {
+    param($State, $Plan)
+    Clear-AutoSortReview -State $State
+    foreach ($key in $Plan.Review.Keys) {
+        if (-not $State.Records.ContainsKey($key)) { continue }
+        $reasons = @($Plan.Review[$key] | Sort-Object)
+        $State.Records[$key] | Add-Member -NotePropertyName AutoSortReview -NotePropertyValue $reasons -Force
+    }
+}
+
 function Update-StateStatus {
     param($State)
 
@@ -579,6 +978,19 @@ function Update-StateStatus {
         }
     }
     $State.Providers = $providers
+
+    foreach ($record in $State.Records.Values) {
+        $record | Add-Member -NotePropertyName CustomRules -NotePropertyValue @() -Force
+        $record | Add-Member -NotePropertyName ReferencedByCustomRules -NotePropertyValue @() -Force
+    }
+    $resolvedCustomRules = @(Get-ResolvedCustomRules -State $State)
+    $activeCustomRules = @($resolvedCustomRules | Where-Object { $_.Applies })
+    foreach ($resolvedRule in $resolvedCustomRules) {
+        $resolvedRule.Subject.CustomRules = @($resolvedRule.Subject.CustomRules) + @($resolvedRule)
+        if ($null -ne $resolvedRule.Target -and $resolvedRule.Target.Key -ne $resolvedRule.Subject.Key) {
+            $resolvedRule.Target.ReferencedByCustomRules = @($resolvedRule.Target.ReferencedByCustomRules) + @($resolvedRule)
+        }
+    }
 
     $incompatiblePartners = @{}
     foreach ($record in $State.Records.Values) {
@@ -600,9 +1012,44 @@ function Update-StateStatus {
             }
         }
     }
+    foreach ($resolvedRule in @($activeCustomRules | Where-Object { $_.Rule.relation -eq 'Incompatible' -and $null -ne $_.Target })) {
+        $record = $resolvedRule.Subject
+        $candidate = $resolvedRule.Target
+        if ($candidate.Key -eq $record.Key) { continue }
+        $togetherInWorkingQueues = $null -ne $record.Target -and $null -ne $candidate.Target
+        $togetherInCreation = $record.InCreation -and $candidate.InCreation
+        if (-not ($togetherInWorkingQueues -or $togetherInCreation)) { continue }
+        if (-not $incompatiblePartners.ContainsKey($record.Key)) {
+            $incompatiblePartners[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        }
+        if (-not $incompatiblePartners.ContainsKey($candidate.Key)) {
+            $incompatiblePartners[$candidate.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        }
+        $localMarker = if ($resolvedRule.VersionConditionText) { "[Local, $($resolvedRule.VersionConditionText)]" } else { '[Local]' }
+        [void]$incompatiblePartners[$record.Key].Add("$($candidate.Name) $localMarker")
+        [void]$incompatiblePartners[$candidate.Key].Add("$($record.Name) $localMarker")
+    }
+
+    $integratedTargets = @{}
+    foreach ($resolvedRule in @($activeCustomRules | Where-Object { $_.Rule.relation -eq 'IntegratedInto' -and $null -ne $_.Target })) {
+        $record = $resolvedRule.Subject
+        $candidate = $resolvedRule.Target
+        if ($candidate.Key -eq $record.Key) { continue }
+        $togetherInWorkingQueues = $null -ne $record.Target -and $null -ne $candidate.Target
+        $togetherInCreation = $record.InCreation -and $candidate.InCreation
+        if (-not ($togetherInWorkingQueues -or $togetherInCreation)) { continue }
+        if (-not $integratedTargets.ContainsKey($record.Key)) {
+            $integratedTargets[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        }
+        $localMarker = if ($resolvedRule.VersionConditionText) { "[Local, $($resolvedRule.VersionConditionText)]" } else { '[Local]' }
+        [void]$integratedTargets[$record.Key].Add("$($candidate.Name) $localMarker")
+    }
 
     foreach ($record in $State.Records.Values) {
         $problems = [System.Collections.Generic.List[string]]::new()
+        if ($record.PSObject.Properties['AutoSortReview']) {
+            foreach ($reason in @($record.AutoSortReview)) { $problems.Add("Auto-sort review: $reason") }
+        }
         if (-not $record.Facts.Exists) { $problems.Add('moddesc.ini is missing') }
         if ($record.Memberships.Count -gt 1 -and $null -eq $record.Target) {
             $problems.Add('Present in multiple working queues')
@@ -611,6 +1058,14 @@ function Update-StateStatus {
         }
         if ($incompatiblePartners.ContainsKey($record.Key)) {
             foreach ($partnerName in @($incompatiblePartners[$record.Key] | Sort-Object)) { $problems.Add("Incompatible with: $partnerName") }
+        }
+        if ($integratedTargets.ContainsKey($record.Key)) {
+            foreach ($targetName in @($integratedTargets[$record.Key] | Sort-Object)) { $problems.Add("Already integrated into: $targetName") }
+        }
+        if ($null -ne $record.Target -or $record.InCreation) {
+            foreach ($resolvedRule in @($record.CustomRules | Where-Object { -not $_.VersionConditionKnown })) {
+                $problems.Add("Local rule version could not be checked: $($resolvedRule.TargetName) ($($resolvedRule.VersionConditionText))")
+            }
         }
 
         if ($null -ne $record.Target) {
@@ -650,12 +1105,43 @@ function Update-StateStatus {
                 }
             }
         }
+        foreach ($resolvedRule in @($record.CustomRules | Where-Object { $_.Applies -and $_.Rule.relation -in @('Requires', 'LoadAfter') })) {
+            $target = $resolvedRule.Target
+            $targetName = [string]$resolvedRule.TargetName
+            $isRequired = $resolvedRule.Rule.relation -eq 'Requires'
+            if ($null -ne $record.Target) {
+                if ($isRequired -and $null -eq $target) {
+                    $problems.Add("Local dependency is missing: $targetName")
+                } elseif ($isRequired -and $null -eq $target.Target) {
+                    $problems.Add("Local dependency is unassigned: $targetName")
+                } elseif ($null -ne $target -and $null -ne $target.Target -and -not (Test-WorkingRecordComesFirst -Earlier $target -Later $record)) {
+                    $label = if ($isRequired) { 'Local dependency' } else { 'Local load-after target' }
+                    if ([int]$target.Target -gt [int]$record.Target) {
+                        $problems.Add("$label is installed later: $targetName")
+                    } else {
+                        $problems.Add("$label is ordered later: $targetName")
+                    }
+                }
+            }
+            if ($record.InCreation) {
+                if ($isRequired -and $null -eq $target) {
+                    $creationProblem = "Local Creation dependency is missing: $targetName"
+                    if (-not $problems.Contains($creationProblem)) { $problems.Add($creationProblem) }
+                } elseif ($isRequired -and -not $target.InCreation) {
+                    $problems.Add("Local dependency is not in Creation List: $targetName")
+                } elseif ($null -ne $target -and $target.InCreation -and -not (Test-CreationRecordComesFirst -Earlier $target -Later $record)) {
+                    $label = if ($isRequired) { 'Local Creation dependency' } else { 'Local Creation load-after target' }
+                    $problems.Add("$label is ordered later: $targetName")
+                }
+            }
+        }
         $record.Status = if ($problems.Count) { $problems -join '; ' } else { 'OK' }
     }
 }
 
 function Set-RecordTarget {
     param($State, [object[]]$Records, [Nullable[int]]$Target)
+    Clear-AutoSortReview -State $State
     foreach ($record in $Records) {
         $oldTarget = $record.Target
         $record.Target = $Target
@@ -731,10 +1217,143 @@ function Invoke-SelfTest {
     if (-not $testAsiRecord.Memberships.Contains(1) -or [int]$testAsiRecord.VersionsByStage[1] -ne 13 -or $testAsiRecord.Status -ne 'OK') { throw 'ASI membership addition regression test failed.' }
     Set-AsiRecordQueueMembership -Record $testAsiRecord -Stage 1 -Include $false
     if ($testAsiRecord.Memberships.Contains(1) -or $testAsiRecord.Status -ne 'Unassigned') { throw 'ASI membership removal regression test failed.' }
+    $savedCustomRulesPath = $script:CustomRulesPath
+    $savedCustomRulesForRoundTrip = @($script:CustomRules)
+    $savedCustomRulesLoadError = $script:CustomRulesLoadError
+    $testRulesDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("ME3TweaksOrganizerRules-{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void](New-Item -ItemType Directory -Path $testRulesDirectory)
+        $script:CustomRulesPath = Join-Path $testRulesDirectory 'OrganizerCustomRules.json'
+        $script:CustomRulesLoadError = ''
+        $script:CustomRules = @([pscustomobject][ordered]@{
+            id = 'selftest-roundtrip'; game = 'LE1'; relation = 'Requires'
+            subject = [pscustomobject]@{ path = 'LE1\Subject\moddesc.ini'; nexusId = 1; providedDlc = @('DLC_MOD_SUBJECT'); name = 'Subject'; version = '1.0' }
+            target = [pscustomobject]@{ path = 'LE1\Target\moddesc.ini'; nexusId = 2; providedDlc = @('DLC_MOD_TARGET'); name = 'Target'; version = '2.0' }
+            versionCondition = [pscustomobject]@{ side = 'Target'; operator = 'GreaterOrEqual'; value = '2.0' }
+            note = 'Round-trip test'; enabled = $true; createdUtc = [DateTime]::UtcNow.ToString('o')
+        })
+        Save-CustomRules
+        $script:CustomRules = @()
+        Load-CustomRules
+        if ($script:CustomRules.Count -ne 1 -or $script:CustomRules[0].relation -ne 'Requires' -or $script:CustomRules[0].target.name -ne 'Target' -or
+            $script:CustomRules[0].versionCondition.operator -ne 'GreaterOrEqual' -or $script:CustomRules[0].versionCondition.value -ne '2.0') {
+            throw 'Local rule JSON round-trip regression test failed.'
+        }
+    } finally {
+        $script:CustomRulesPath = $savedCustomRulesPath
+        $script:CustomRules = @($savedCustomRulesForRoundTrip)
+        $script:CustomRulesLoadError = $savedCustomRulesLoadError
+        if (Test-Path -LiteralPath $testRulesDirectory) { Remove-Item -LiteralPath $testRulesDirectory -Recurse -Force }
+    }
+    if ((Compare-ModVersions -Left '1.10' -Right '1.9') -le 0 -or (Compare-ModVersions -Left '2.0-beta' -Right '2.0') -ge 0) {
+        throw 'Mod version comparison regression test failed.'
+    }
+    $versionTestRule = [pscustomobject]@{ versionCondition = [pscustomobject]@{ side = 'Target'; operator = 'GreaterThan'; value = '1.5' } }
+    $versionTestTarget = [pscustomobject]@{ Facts = [pscustomobject]@{ ModVersion = '1.6' } }
+    if (-not (Test-RuleVersionCondition -Rule $versionTestRule -SubjectRecord $null -TargetRecord $versionTestTarget)) { throw 'Version condition positive regression test failed.' }
+    $versionTestTarget.Facts.ModVersion = '1.4'
+    if (Test-RuleVersionCondition -Rule $versionTestRule -SubjectRecord $null -TargetRecord $versionTestTarget) { throw 'Version condition negative regression test failed.' }
+
+    $newSortTestRecord = {
+        param(
+            [string]$Key, [string]$Name, $MountId,
+            [string[]]$Provided = @(), [string[]]$Required = @(),
+            [Nullable[int]]$Target = 1, [bool]$InCreation = $false,
+            [int]$ReferenceOrder = 0
+        )
+        $memberships = [System.Collections.Generic.List[int]]::new()
+        $queueOrders = @{}
+        if ($null -ne $Target) { $memberships.Add([int]$Target); $queueOrders[[int]$Target] = $ReferenceOrder }
+        [pscustomobject]@{
+            Key = $Key; Name = $Name; ReferenceOrder = $ReferenceOrder; Target = $Target; InCreation = $InCreation
+            Memberships = $memberships; QueueOrders = $queueOrders; CustomRules = @()
+            Facts = [pscustomobject]@{
+                MountIds = if ($null -eq $MountId) { @() } else { @([int]$MountId) }
+                Provided = @($Provided); Required = @($Required); Conditional = @()
+            }
+        }
+    }
+    $provider = & $newSortTestRecord -Key 'provider' -Name 'Provider' -MountId 100 -Provided @('DLC_TEST_A') -ReferenceOrder 1
+    $dependent = & $newSortTestRecord -Key 'dependent' -Name 'Dependent' -MountId 10 -Required @('DLC_TEST_A') -ReferenceOrder 0
+    $plain = & $newSortTestRecord -Key 'plain' -Name 'Plain' -MountId 20 -ReferenceOrder 2
+    $missing = & $newSortTestRecord -Key 'missing' -Name 'Missing dependency' -MountId 5 -Required @('DLC_TEST_MISSING') -ReferenceOrder 3
+    $localTarget = & $newSortTestRecord -Key 'local-target' -Name 'Local target' -MountId 200 -ReferenceOrder 4
+    $localSubject = & $newSortTestRecord -Key 'local-subject' -Name 'Local subject' -MountId 1 -ReferenceOrder 5
+    $creationProvider = & $newSortTestRecord -Key 'creation-provider' -Name 'Creation provider' -MountId 300 -Provided @('DLC_TEST_CREATION') -Target $null -InCreation $true -ReferenceOrder 0
+    $creationDependent = & $newSortTestRecord -Key 'creation-dependent' -Name 'Creation dependent' -MountId 2 -Required @('DLC_TEST_CREATION') -ReferenceOrder 6
+    $localSubject.CustomRules = @([pscustomobject]@{
+        VersionConditionKnown = $true; Applies = $true; Rule = [pscustomobject]@{ relation = 'LoadAfter' }
+        Target = $localTarget; TargetName = $localTarget.Name
+    })
+    $sortState = [pscustomobject]@{ Records = @{} }
+    foreach ($record in @($provider, $dependent, $plain, $missing, $localTarget, $localSubject, $creationProvider, $creationDependent)) { $sortState.Records[$record.Key] = $record }
+    $sortScope = @($provider, $dependent, $plain, $missing, $localTarget, $localSubject, $creationDependent)
+    $sortPlan = Get-AutoSortPlan -State $sortState -Records $sortScope
+    $sortKeys = @($sortPlan.Ordered.Key)
+    if ([Array]::IndexOf($sortKeys, 'provider') -ge [Array]::IndexOf($sortKeys, 'dependent')) { throw 'Auto-sort native dependency regression test failed.' }
+    if ([Array]::IndexOf($sortKeys, 'local-target') -ge [Array]::IndexOf($sortKeys, 'local-subject')) { throw 'Auto-sort local load-after regression test failed.' }
+    if (-not $sortPlan.Review.ContainsKey('missing') -or $sortKeys[-1] -ne 'missing') {
+        $reviewText = @($sortPlan.Review.Keys | ForEach-Object { "$_=$(@($sortPlan.Review[$_] | Sort-Object) -join '|')" }) -join '; '
+        throw "Auto-sort unresolved dependency placement regression test failed. Provider facts: $($provider.Facts.Provided -join ','); creation facts: $($creationProvider.Facts.Provided -join ','); Order: $($sortKeys -join ', '); reviews: $reviewText"
+    }
+    if ($sortPlan.Review.ContainsKey('creation-dependent')) { throw 'Auto-sort Creation provider regression test failed.' }
+
+    $cycleA = & $newSortTestRecord -Key 'cycle-a' -Name 'Cycle A' -MountId 1
+    $cycleB = & $newSortTestRecord -Key 'cycle-b' -Name 'Cycle B' -MountId 2
+    $cycleA.CustomRules = @([pscustomobject]@{ VersionConditionKnown = $true; Applies = $true; Rule = [pscustomobject]@{ relation = 'Requires' }; Target = $cycleB; TargetName = $cycleB.Name })
+    $cycleB.CustomRules = @([pscustomobject]@{ VersionConditionKnown = $true; Applies = $true; Rule = [pscustomobject]@{ relation = 'Requires' }; Target = $cycleA; TargetName = $cycleA.Name })
+    $cycleState = [pscustomobject]@{ Records = @{ 'cycle-a' = $cycleA; 'cycle-b' = $cycleB } }
+    $cyclePlan = Get-AutoSortPlan -State $cycleState -Records @($cycleA, $cycleB)
+    if (-not $cyclePlan.CycleDetected -or $cyclePlan.Review.Count -ne 2) { throw 'Auto-sort dependency cycle regression test failed.' }
+
+    $savedCustomRules = @($script:CustomRules)
+    try {
+        $ruleState = Get-GameState -Game 'LE1' -SetId (Get-ActiveSetId)
+        $ruleRecords = @($ruleState.Records.Values | Where-Object { $null -ne $_.Target -and $_.Facts.Exists -and -not $_.InCreation } | Sort-Object @{ Expression = { [int]$_.Target } }, @{ Expression = { Get-RecordQueueOrder $_ } })
+        if ($ruleRecords.Count -ge 2) {
+            $earlierRecord = $ruleRecords[0]
+            $laterRecord = $ruleRecords[-1]
+            $testSubjectIdentity = Get-RecordRuleIdentity $earlierRecord
+            $testTargetIdentity = Get-RecordRuleIdentity $laterRecord
+            $script:CustomRules = @($savedCustomRules) + @([pscustomobject][ordered]@{
+                id = 'selftest-local-incompatibility'
+                game = 'LE1'
+                relation = 'Incompatible'
+                subject = $testSubjectIdentity
+                target = $testTargetIdentity
+                note = 'In-memory self-test only'
+                enabled = $true
+                createdUtc = [DateTime]::UtcNow.ToString('o')
+            }, [pscustomobject][ordered]@{
+                id = 'selftest-local-requires'; game = 'LE1'; relation = 'Requires'
+                subject = $testSubjectIdentity; target = $testTargetIdentity; note = ''; enabled = $true; createdUtc = [DateTime]::UtcNow.ToString('o')
+            }, [pscustomobject][ordered]@{
+                id = 'selftest-local-loadafter'; game = 'LE1'; relation = 'LoadAfter'
+                subject = $testSubjectIdentity; target = $testTargetIdentity; note = ''; enabled = $true; createdUtc = [DateTime]::UtcNow.ToString('o')
+            }, [pscustomobject][ordered]@{
+                id = 'selftest-local-integrated'; game = 'LE1'; relation = 'IntegratedInto'
+                subject = $testSubjectIdentity; target = $testTargetIdentity; note = ''; enabled = $true; createdUtc = [DateTime]::UtcNow.ToString('o')
+            })
+            Update-StateStatus -State $ruleState
+            if ($earlierRecord.Status -notlike '*Incompatible with:*' -or -not $earlierRecord.Status.Contains('[Local]') -or
+                $laterRecord.Status -notlike '*Incompatible with:*' -or -not $laterRecord.Status.Contains('[Local]')) {
+                throw 'Local incompatibility rule regression test failed.'
+            }
+            if ($earlierRecord.Status -notlike '*Local dependency is installed later:*' -or $earlierRecord.Status -notlike '*Local load-after target is installed later:*') {
+                throw 'Local dependency/load-after ordering regression test failed.'
+            }
+            if ($earlierRecord.Status -notlike '*Already integrated into:*') { throw 'Local integrated-mod rule regression test failed.' }
+        }
+    } finally {
+        $script:CustomRules = @($savedCustomRules)
+    }
     $results = foreach ($game in @('LE1', 'LE2', 'LE3')) {
         $activeSetId = Get-ActiveSetId
         $state = Get-GameState -Game $game -SetId $activeSetId
         $missingMetadata = @($state.Records.Values | Where-Object { -not $_.Facts.Exists })
+        $assignedForAutoSort = @($state.Records.Values | Where-Object { $null -ne $_.Target })
+        $autoSortPlan = Get-AutoSortPlan -State $state -Records $assignedForAutoSort
+        if ($autoSortPlan.Ordered.Count -ne $assignedForAutoSort.Count) { throw "Auto-sort did not return every assigned $game mod." }
         foreach ($stage in $state.StageNames.Keys) {
             $originalAsi = @($state.Queues[$stage].Data.asimods | Where-Object { $null -ne $_.updategroup } | ForEach-Object { "$([int]$_.updategroup):$([int]$_.version)" } | Sort-Object)
             $rebuiltAsi = @($state.AsiRecords.Values | Where-Object { $_.Memberships.Contains([int]$stage) } | ForEach-Object {
@@ -757,6 +1376,8 @@ function Invoke-SelfTest {
             DependencyOrderProblems = @($state.Records.Values | Where-Object { $_.Status -like '*Dependency is installed later*' -or $_.Status -like '*Dependency is ordered later*' }).Count
             CompatibilityOrderProblems = @($state.Records.Values | Where-Object { $_.Status -like '*Compatibility target is installed later*' -or $_.Status -like '*Compatibility target is ordered later*' }).Count
             IncompatibilityProblems = @($state.Records.Values | Where-Object { $_.Status -like '*Incompatible with:*' }).Count
+            AutoSortEdges = $autoSortPlan.EdgeCount
+            AutoSortReview = $autoSortPlan.Review.Count
             MissingMetadata = $missingMetadata.Count
             MissingMetadataNames = @($missingMetadata.Name) -join '; '
             MissingProviders = @($state.Records.Values | Where-Object { $_.Status -like '*Dependency is missing*' }).Count
@@ -768,6 +1389,10 @@ function Invoke-SelfTest {
     Write-Output "All view ASI plugins: $($allState.AsiRecords.Count)"
     Write-Output 'ASI membership add/remove: OK'
     Write-Output 'ASI queue round-trip: OK'
+    Write-Output 'Local rule resolution/status: OK'
+    Write-Output 'Local rule JSON round-trip: OK'
+    Write-Output 'Version conditions/integrated rules: OK'
+    Write-Output 'Dependency-aware auto-sort graph: OK'
 }
 
 if ($SelfTest) {
@@ -823,7 +1448,7 @@ if (-not $script:QueueRoot) {
 }
 
 $form = [System.Windows.Forms.Form]@{
-    Text = 'ME3Tweaks Batch Queue Organizer'
+    Text = "ME3Tweaks Batch Queue Organizer v$($script:AppVersion)"
     Width = 1400
     Height = 820
     StartPosition = 'CenterScreen'
@@ -887,20 +1512,23 @@ $targetBox = [System.Windows.Forms.ComboBox]@{ Left = 12; Top = 180; Width = 390
 $assignButton = [System.Windows.Forms.Button]@{ Text = 'Assign selected mods'; Left = 12; Top = 220; Width = 390; Height = 36 }
 $moveUpButton = [System.Windows.Forms.Button]@{ Text = 'Move up'; Left = 12; Top = 265; Width = 190; Height = 30 }
 $moveDownButton = [System.Windows.Forms.Button]@{ Text = 'Move down'; Left = 212; Top = 265; Width = 190; Height = 30 }
-$mountOrderButton = [System.Windows.Forms.Button]@{ Text = 'Sort queue order by Mount ID'; Left = 12; Top = 300; Width = 390; Height = 30 }
-$newQueueButton = [System.Windows.Forms.Button]@{ Text = 'New queue'; Left = 12; Top = 335; Width = 190; Height = 30 }
-$deleteQueueButton = [System.Windows.Forms.Button]@{ Text = 'Delete filtered queue'; Left = 212; Top = 335; Width = 190; Height = 30 }
+$mountOrderButton = [System.Windows.Forms.Button]@{ Text = 'Sort by Mount ID'; Left = 12; Top = 300; Width = 190; Height = 30 }
+$dependencySortButton = [System.Windows.Forms.Button]@{ Text = 'Auto-sort...'; Left = 212; Top = 300; Width = 190; Height = 30 }
+$newQueueButton = [System.Windows.Forms.Button]@{ Text = 'New queue'; Left = 12; Top = 335; Width = 120; Height = 30 }
+$renameQueueButton = [System.Windows.Forms.Button]@{ Text = 'Rename queue'; Left = 142; Top = 335; Width = 120; Height = 30 }
+$deleteQueueButton = [System.Windows.Forms.Button]@{ Text = 'Delete queue'; Left = 272; Top = 335; Width = 130; Height = 30 }
 $backupButton = [System.Windows.Forms.Button]@{ Text = 'Manage backups'; Left = 12; Top = 370; Width = 390; Height = 30 }
 $restoreBeforeInstallToggle = [System.Windows.Forms.CheckBox]@{ Text = 'Restore game before install'; Left = 12; Top = 410; Width = 390 }
 $asiSelectAllButton = [System.Windows.Forms.Button]@{ Text = 'Select all ASI plugins'; Left = 12; Top = 125; Width = 190; Height = 32; Visible = $false }
 $asiClearAllButton = [System.Windows.Forms.Button]@{ Text = 'Clear ASI plugins'; Left = 212; Top = 125; Width = 190; Height = 32; Visible = $false }
 $asiModeHint = [System.Windows.Forms.Label]@{ Text = 'Select a specific queue above, then toggle its ASI plugins in the list.'; Left = 12; Top = 170; Width = 390; Height = 55; Visible = $false }
 $dependencyLabel = [System.Windows.Forms.Label]@{ Text = 'Details'; Left = 12; Top = 440; AutoSize = $true }
+$manageRulesButton = [System.Windows.Forms.Button]@{ Text = 'Manage local rules...'; Left = 252; Top = 435; Width = 150; Height = 26; Enabled = $false }
 $dependencyBox = [System.Windows.Forms.TextBox]@{ Left = 12; Top = 465; Width = 390; Height = 145; Multiline = $true; ReadOnly = $true; ScrollBars = 'Vertical' }
 $nexusLabel = [System.Windows.Forms.Label]@{ Text = 'Nexus:'; Left = 12; Top = 623; AutoSize = $true }
 $nexusLink = [System.Windows.Forms.LinkLabel]@{ Text = ''; Left = 62; Top = 620; Width = 340; Height = 22; AutoEllipsis = $true; LinkBehavior = 'HoverUnderline' }
 $hint = [System.Windows.Forms.Label]@{ Text = 'Use Ctrl or Shift to select multiple mods.'; Left = 12; Top = 650; Width = 390; Height = 40 }
-$details.Controls.AddRange(@($selectedLabel, $pathLabel, $creationToggle, $targetLabel, $targetBox, $assignButton, $moveUpButton, $moveDownButton, $mountOrderButton, $newQueueButton, $deleteQueueButton, $backupButton, $restoreBeforeInstallToggle, $asiSelectAllButton, $asiClearAllButton, $asiModeHint, $dependencyLabel, $dependencyBox, $nexusLabel, $nexusLink, $hint))
+$details.Controls.AddRange(@($selectedLabel, $pathLabel, $creationToggle, $targetLabel, $targetBox, $assignButton, $moveUpButton, $moveDownButton, $mountOrderButton, $dependencySortButton, $newQueueButton, $renameQueueButton, $deleteQueueButton, $backupButton, $restoreBeforeInstallToggle, $asiSelectAllButton, $asiClearAllButton, $asiModeHint, $dependencyLabel, $manageRulesButton, $dependencyBox, $nexusLabel, $nexusLink, $hint))
 $split.Panel2.Controls.Add($details)
 $form.Controls.Add($split)
 $form.Controls.Add($top)
@@ -927,6 +1555,219 @@ $nexusLink.add_LinkClicked({
         [System.Windows.Forms.MessageBox]::Show("Could not open the Nexus page.`r`n`r`n$($_.Exception.Message)", 'Open Nexus page', 'OK', 'Error')
     }
 })
+
+function Get-LocalRuleDetailsText {
+    param($Record)
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($resolvedRule in @($Record.CustomRules | Sort-Object @{ Expression = { $_.Rule.relation } }, TargetName)) {
+        $relation = switch ($resolvedRule.Rule.relation) {
+            'Requires' { 'Requires' }
+            'LoadAfter' { 'Load after (when present)' }
+            'Incompatible' { 'Incompatible with' }
+            'IntegratedInto' { 'Integrated into' }
+        }
+        $line = "[Local] $relation`: $($resolvedRule.TargetName)"
+        if ($resolvedRule.VersionConditionText) {
+            if (-not $resolvedRule.VersionConditionKnown) { $line += " (cannot check $($resolvedRule.VersionConditionText): version unknown)" }
+            elseif (-not $resolvedRule.Applies) { $line += " (inactive for installed version $($resolvedRule.ComparedVersion); requires $($resolvedRule.VersionConditionText))" }
+            else { $line += " (when $($resolvedRule.VersionConditionText))" }
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$resolvedRule.Rule.note)) { $line += " - $($resolvedRule.Rule.note)" }
+        $lines.Add($line)
+    }
+    foreach ($resolvedRule in @($Record.ReferencedByCustomRules | Sort-Object @{ Expression = { $_.Rule.relation } }, @{ Expression = { $_.Subject.Name } })) {
+        $relation = switch ($resolvedRule.Rule.relation) {
+            'Requires' { 'Required by' }
+            'LoadAfter' { 'Must load before' }
+            'Incompatible' { 'Incompatible with' }
+            'IntegratedInto' { 'Includes' }
+        }
+        $line = "[Local] $relation`: $($resolvedRule.Subject.Name)"
+        if ($resolvedRule.VersionConditionText) {
+            if (-not $resolvedRule.VersionConditionKnown) { $line += " (cannot check $($resolvedRule.VersionConditionText): version unknown)" }
+            elseif (-not $resolvedRule.Applies) { $line += " (inactive for installed version $($resolvedRule.ComparedVersion); requires $($resolvedRule.VersionConditionText))" }
+            else { $line += " (when $($resolvedRule.VersionConditionText))" }
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$resolvedRule.Rule.note)) { $line += " - $($resolvedRule.Rule.note)" }
+        $lines.Add($line)
+    }
+    return $(if ($lines.Count) { $lines -join "`r`n" } else { 'None' })
+}
+
+function Show-LocalRuleManager {
+    if ($asiEditToggle.Checked -or $list.SelectedItems.Count -ne 1) { return }
+    $subject = $list.SelectedItems[0].Tag
+    if ($null -eq $subject -or $null -eq $subject.Facts -or -not $subject.Facts.Exists) {
+        [System.Windows.Forms.MessageBox]::Show('Local rules can only be edited for a mod that is currently available.', 'Local rules', 'OK', 'Information')
+        return
+    }
+    if (-not [string]::IsNullOrWhiteSpace($script:CustomRulesLoadError)) {
+        [System.Windows.Forms.MessageBox]::Show("The local rule file could not be read, so editing is disabled to protect it.`r`n`r`n$($script:CustomRulesPath)`r`n`r`n$($script:CustomRulesLoadError)", 'Local rule file error', 'OK', 'Error')
+        return
+    }
+    $gameState = if ($script:State.Game -eq 'All') { $script:State.GameStates[$subject.Game] } else { $script:State }
+    $dialog = [System.Windows.Forms.Form]@{ Text = "Local rules - $($subject.Name)"; Width = 860; Height = 620; StartPosition = 'CenterParent'; MinimizeBox = $false; MaximizeBox = $false }
+    if (Test-Path -LiteralPath $iconPath) { $dialog.Icon = [System.Drawing.Icon]::new($iconPath) }
+    $subjectVersion = if ([string]::IsNullOrWhiteSpace([string]$subject.Facts.ModVersion)) { 'version unknown' } else { "version $($subject.Facts.ModVersion)" }
+    $subjectLabel = [System.Windows.Forms.Label]@{ Text = "Rules defined for: $($subject.Name) ($($subject.Game), $subjectVersion)"; Left = 12; Top = 14; Width = 815; Height = 24; Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold) }
+    $rulesList = [System.Windows.Forms.ListView]@{ Left = 12; Top = 42; Width = 815; Height = 250; View = 'Details'; FullRowSelect = $true; GridLines = $true; MultiSelect = $true; HideSelection = $false }
+    [void]$rulesList.Columns.Add('Rule', 145)
+    [void]$rulesList.Columns.Add('Target mod', 245)
+    [void]$rulesList.Columns.Add('Version condition', 195)
+    [void]$rulesList.Columns.Add('Note', 225)
+    $relationLabel = [System.Windows.Forms.Label]@{ Text = 'Rule type:'; Left = 12; Top = 305; AutoSize = $true }
+    $relationBox = [System.Windows.Forms.ComboBox]@{ Left = 12; Top = 327; Width = 235; DropDownStyle = 'DropDownList'; DisplayMember = 'Display' }
+    foreach ($option in @(
+        [pscustomobject]@{ Display = 'Requires'; Relation = 'Requires' },
+        [pscustomobject]@{ Display = 'Load after (when present)'; Relation = 'LoadAfter' },
+        [pscustomobject]@{ Display = 'Incompatible'; Relation = 'Incompatible' },
+        [pscustomobject]@{ Display = 'Integrated into target mod'; Relation = 'IntegratedInto' }
+    )) { [void]$relationBox.Items.Add($option) }
+    $relationBox.SelectedIndex = 0
+    $targetModLabel = [System.Windows.Forms.Label]@{ Text = 'Target mod:'; Left = 260; Top = 305; AutoSize = $true }
+    $targetModBox = [System.Windows.Forms.ComboBox]@{ Left = 260; Top = 327; Width = 567; DropDownStyle = 'DropDown'; DisplayMember = 'Display'; AutoCompleteMode = 'SuggestAppend'; AutoCompleteSource = 'ListItems' }
+    foreach ($candidate in @($gameState.Records.Values | Where-Object { $_.Key -ne $subject.Key -and $_.Facts.Exists } | Sort-Object Name, Path)) {
+        $candidateVersion = if ([string]::IsNullOrWhiteSpace([string]$candidate.Facts.ModVersion)) { 'version unknown' } else { "v$($candidate.Facts.ModVersion)" }
+        [void]$targetModBox.Items.Add([pscustomobject]@{ Display = "$($candidate.Name) ($candidateVersion)  [$($candidate.Path)]"; Record = $candidate })
+    }
+    if ($targetModBox.Items.Count) { $targetModBox.SelectedIndex = 0 }
+    $versionSideLabel = [System.Windows.Forms.Label]@{ Text = 'Version applies to:'; Left = 12; Top = 370; AutoSize = $true }
+    $versionSideBox = [System.Windows.Forms.ComboBox]@{ Left = 12; Top = 392; Width = 190; DropDownStyle = 'DropDownList'; DisplayMember = 'Display'; Enabled = $false }
+    [void]$versionSideBox.Items.Add([pscustomobject]@{ Display = 'Target mod'; Side = 'Target' })
+    [void]$versionSideBox.Items.Add([pscustomobject]@{ Display = 'Selected mod'; Side = 'Subject' })
+    $versionSideBox.SelectedIndex = 0
+    $versionOperatorLabel = [System.Windows.Forms.Label]@{ Text = 'Version comparison:'; Left = 215; Top = 370; AutoSize = $true }
+    $versionOperatorBox = [System.Windows.Forms.ComboBox]@{ Left = 215; Top = 392; Width = 240; DropDownStyle = 'DropDownList'; DisplayMember = 'Display' }
+    foreach ($option in @(
+        [pscustomobject]@{ Display = 'Any version'; Operator = 'Any' },
+        [pscustomobject]@{ Display = 'Exactly (=)'; Operator = 'Equal' },
+        [pscustomobject]@{ Display = 'Less than (<)'; Operator = 'LessThan' },
+        [pscustomobject]@{ Display = 'At most (<=)'; Operator = 'LessOrEqual' },
+        [pscustomobject]@{ Display = 'Greater than (>)'; Operator = 'GreaterThan' },
+        [pscustomobject]@{ Display = 'At least (>=)'; Operator = 'GreaterOrEqual' }
+    )) { [void]$versionOperatorBox.Items.Add($option) }
+    $versionOperatorBox.SelectedIndex = 0
+    $versionValueLabel = [System.Windows.Forms.Label]@{ Text = 'Version value (optional):'; Left = 470; Top = 370; AutoSize = $true }
+    $versionValueBox = [System.Windows.Forms.TextBox]@{ Left = 470; Top = 392; Width = 357; Height = 25; Enabled = $false }
+    $noteLabel = [System.Windows.Forms.Label]@{ Text = 'Optional note:'; Left = 12; Top = 435; AutoSize = $true }
+    $noteBox = [System.Windows.Forms.TextBox]@{ Left = 12; Top = 457; Width = 815; Height = 25 }
+    $addRuleButton = [System.Windows.Forms.Button]@{ Text = 'Add rule'; Left = 12; Top = 510; Width = 150; Height = 32 }
+    $removeRuleButton = [System.Windows.Forms.Button]@{ Text = 'Remove selected'; Left = 172; Top = 510; Width = 170; Height = 32; Enabled = $false }
+    $rulesHint = [System.Windows.Forms.Label]@{ Text = 'Rules apply to this game in every set. moddesc.ini metadata keeps priority.'; Left = 355; Top = 512; Width = 300; Height = 40 }
+    $closeRulesButton = [System.Windows.Forms.Button]@{ Text = 'Close'; Left = 677; Top = 510; Width = 150; Height = 32 }
+    $dialog.Controls.AddRange(@($subjectLabel, $rulesList, $relationLabel, $relationBox, $targetModLabel, $targetModBox, $versionSideLabel, $versionSideBox, $versionOperatorLabel, $versionOperatorBox, $versionValueLabel, $versionValueBox, $noteLabel, $noteBox, $addRuleButton, $removeRuleButton, $rulesHint, $closeRulesButton))
+    $versionOperatorBox.add_SelectedIndexChanged({
+        $usesVersion = $versionOperatorBox.SelectedIndex -gt 0
+        $versionSideBox.Enabled = $usesVersion
+        $versionValueBox.Enabled = $usesVersion
+        if (-not $usesVersion) { $versionValueBox.Clear() }
+    })
+
+    $getSubjectRules = {
+        @($script:CustomRules | Where-Object {
+            $_.game -eq $subject.Game -and (Resolve-RuleIdentity -State $gameState -Identity $_.subject).Key -eq $subject.Key
+        })
+    }
+    $refreshRules = {
+        $rulesList.Items.Clear()
+        foreach ($rule in @(& $getSubjectRules | Sort-Object relation, @{ Expression = { Get-RuleIdentityDisplayName $_.target } })) {
+            $relation = switch ($rule.relation) { 'Requires' { 'Requires' }; 'LoadAfter' { 'Load after' }; 'Incompatible' { 'Incompatible' }; 'IntegratedInto' { 'Integrated into' } }
+            $item = [System.Windows.Forms.ListViewItem]::new($relation)
+            [void]$item.SubItems.Add((Get-RuleIdentityDisplayName $rule.target))
+            [void]$item.SubItems.Add((Get-VersionConditionDisplayText $rule.versionCondition))
+            [void]$item.SubItems.Add([string]$rule.note)
+            $item.Tag = $rule
+            [void]$rulesList.Items.Add($item)
+        }
+        $removeRuleButton.Enabled = $rulesList.SelectedItems.Count -gt 0
+    }
+    & $refreshRules
+    $rulesList.add_SelectedIndexChanged({ $removeRuleButton.Enabled = $rulesList.SelectedItems.Count -gt 0 })
+    $addRuleButton.add_Click({
+        if ($targetModBox.SelectedIndex -lt 0) {
+            [System.Windows.Forms.MessageBox]::Show('Select a target mod first.', 'Local rules', 'OK', 'Information')
+            return
+        }
+        $relation = [string]$relationBox.SelectedItem.Relation
+        $targetRecord = $targetModBox.SelectedItem.Record
+        $versionOperator = [string]$versionOperatorBox.SelectedItem.Operator
+        $versionValue = $versionValueBox.Text.Trim()
+        if ($versionOperator -ne 'Any' -and [string]::IsNullOrWhiteSpace($versionValue)) {
+            [System.Windows.Forms.MessageBox]::Show('Enter a version value, or select Any version.', 'Local rules', 'OK', 'Information')
+            return
+        }
+        $versionCondition = ConvertTo-NormalizedVersionCondition ([pscustomobject]@{
+            side = [string]$versionSideBox.SelectedItem.Side
+            operator = $versionOperator
+            value = $versionValue
+        })
+        $duplicate = @(& $getSubjectRules | Where-Object {
+            $existingVersionCondition = ConvertTo-NormalizedVersionCondition $_.versionCondition
+            $_.relation -eq $relation -and
+            $existingVersionCondition.side -eq $versionCondition.side -and
+            $existingVersionCondition.operator -eq $versionCondition.operator -and
+            $existingVersionCondition.value -ieq $versionCondition.value -and (
+                ([string]$_.target.path -and [string]$_.target.path -ieq [string]$targetRecord.Path) -or
+                (Resolve-RuleIdentity -State $gameState -Identity $_.target).Key -eq $targetRecord.Key
+            )
+        }).Count -gt 0
+        if ($duplicate) {
+            [System.Windows.Forms.MessageBox]::Show('This rule already exists.', 'Local rules', 'OK', 'Information')
+            return
+        }
+        $newRule = [pscustomobject][ordered]@{
+            id = [guid]::NewGuid().ToString('D')
+            game = [string]$subject.Game
+            relation = $relation
+            subject = Get-RecordRuleIdentity $subject
+            target = Get-RecordRuleIdentity $targetRecord
+            versionCondition = $versionCondition
+            note = $noteBox.Text.Trim()
+            enabled = $true
+            createdUtc = [DateTime]::UtcNow.ToString('o')
+        }
+        $script:CustomRules += $newRule
+        try {
+            Save-CustomRules
+        } catch {
+            $script:CustomRules = @($script:CustomRules | Where-Object { $_.id -ne $newRule.id })
+            [System.Windows.Forms.MessageBox]::Show("The local rule could not be saved.`r`n`r`n$($_.Exception.Message)", 'Save local rule', 'OK', 'Error')
+            return
+        }
+        $noteBox.Clear()
+        $versionOperatorBox.SelectedIndex = 0
+        & $refreshRules
+    })
+    $removeRuleButton.add_Click({
+        $selectedRules = @($rulesList.SelectedItems | ForEach-Object { $_.Tag })
+        if (-not $selectedRules.Count) { return }
+        $answer = [System.Windows.Forms.MessageBox]::Show("Remove $($selectedRules.Count) selected local rule(s)?", 'Remove local rules', 'YesNo', 'Warning')
+        if ($answer -ne 'Yes') { return }
+        $selectedIds = @{}; foreach ($rule in $selectedRules) { $selectedIds[[string]$rule.id] = $true }
+        $previousRules = @($script:CustomRules)
+        $script:CustomRules = @($script:CustomRules | Where-Object { -not $selectedIds.ContainsKey([string]$_.id) })
+        try {
+            Save-CustomRules
+        } catch {
+            $script:CustomRules = @($previousRules)
+            [System.Windows.Forms.MessageBox]::Show("The local rules could not be saved.`r`n`r`n$($_.Exception.Message)", 'Save local rules', 'OK', 'Error')
+            return
+        }
+        & $refreshRules
+    })
+    $closeRulesButton.add_Click({ $dialog.Close() })
+    [void]$dialog.ShowDialog($form)
+
+    if ($script:State.Game -eq 'All') {
+        foreach ($state in $script:State.GameStates.Values) { Clear-AutoSortReview -State $state; Update-StateStatus -State $state }
+    } else {
+        Clear-AutoSortReview -State $script:State
+        Update-StateStatus -State $script:State
+    }
+    $selectedKeys = @{}; $selectedKeys[$subject.Key] = $true
+    Refresh-List -PreserveSelection $selectedKeys -PreserveViewport
+}
 
 function Get-MembershipText($record) {
     if ($record.Memberships.Count -eq 0) { return 'Unassigned' }
@@ -974,10 +1815,11 @@ function Set-FilterItemsForMode {
 function Update-ModeControls {
     $asiMode = $asiEditToggle.Checked
     $creationMode = $creationEditToggle.Checked
-    foreach ($control in @($creationToggle, $targetLabel, $targetBox, $assignButton, $moveUpButton, $moveDownButton, $mountOrderButton, $newQueueButton, $deleteQueueButton)) { $control.Visible = -not $asiMode }
+    foreach ($control in @($creationToggle, $targetLabel, $targetBox, $assignButton, $moveUpButton, $moveDownButton, $mountOrderButton, $dependencySortButton, $newQueueButton, $renameQueueButton, $deleteQueueButton, $manageRulesButton)) { $control.Visible = -not $asiMode }
     foreach ($control in @($asiSelectAllButton, $asiClearAllButton, $asiModeHint)) { $control.Visible = $asiMode }
     $asiSelectAllButton.Enabled = $asiMode -and $script:State -and $script:State.Game -ne 'All' -and $queueFilterBox.SelectedIndex -gt 0
     $asiClearAllButton.Enabled = $asiSelectAllButton.Enabled
+    $renameQueueButton.Enabled = -not $asiMode -and $script:State -and $script:State.Game -ne 'All' -and -not $creationMode -and $queueFilterBox.SelectedIndex -gt 0 -and [int]$queueFilterBox.SelectedItem.Stage -gt 0
     $sortBox.Enabled = -not $asiMode
     $creationEditToggle.Enabled = -not ($script:State -and $script:State.Game -eq 'All')
     $asiEditToggle.Enabled = $null -ne $script:State
@@ -991,6 +1833,7 @@ function Update-ModeControls {
         $pathLabel.Text = ''
         $dependencyBox.Text = ''
         Set-NexusLink
+        $manageRulesButton.Enabled = $false
     }
     Set-ListMode
 }
@@ -1083,6 +1926,7 @@ function Refresh-QueueSelectors {
     $assignButton.Enabled = -not ($readOnly -or $creationMode -or $asiEditToggle.Checked)
     $saveButton.Enabled = -not $readOnly
     $newQueueButton.Enabled = -not ($readOnly -or $creationMode -or $asiEditToggle.Checked)
+    $renameQueueButton.Enabled = -not ($readOnly -or $creationMode -or $asiEditToggle.Checked) -and $queueFilterBox.SelectedIndex -gt 0 -and [int]$queueFilterBox.SelectedItem.Stage -gt 0
     $deleteQueueButton.Enabled = -not ($readOnly -or $creationMode -or $asiEditToggle.Checked)
     $queueFilterBox.Enabled = -not $creationMode
     Update-MoveButtons
@@ -1514,6 +2358,84 @@ function Remove-FilteredQueue {
     Refresh-List
 }
 
+function Rename-FilteredQueue {
+    if ($script:State.Game -eq 'All' -or $creationEditToggle.Checked -or $asiEditToggle.Checked -or $queueFilterBox.SelectedIndex -le 0) {
+        [System.Windows.Forms.MessageBox]::Show('Select a specific working queue in the queue filter first.', 'No queue selected', 'OK', 'Information')
+        return
+    }
+    if ($script:State.Dirty) {
+        [System.Windows.Forms.MessageBox]::Show('Save or reload current changes before renaming a queue.', 'ME3Tweaks Organizer', 'OK', 'Warning')
+        return
+    }
+    $stage = [int]$queueFilterBox.SelectedItem.Stage
+    if ($stage -le 0 -or -not $script:State.Queues.ContainsKey([string]$stage)) { return }
+    $oldName = [string]$script:State.StageNames[[string]$stage]
+    $newName = [Microsoft.VisualBasic.Interaction]::InputBox('Enter the new queue name:', 'Rename managed queue', $oldName).Trim()
+    if (-not $newName -or $newName -ceq $oldName) { return }
+    if ($newName.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+        [System.Windows.Forms.MessageBox]::Show('The queue name contains characters that cannot be used in a file name.', 'Invalid queue name', 'OK', 'Error')
+        return
+    }
+
+    $queueInfo = $script:State.Queues[[string]$stage]
+    $oldPath = (Resolve-Path -LiteralPath $queueInfo.Path).Path
+    $queueDirectory = Split-Path $oldPath -Parent
+    $resolvedQueueRoot = [System.IO.Path]::GetFullPath($script:QueueRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $resolvedInactiveRoot = [System.IO.Path]::GetFullPath($script:InactiveQueueRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $allowedDirectory = $queueDirectory -ieq $resolvedQueueRoot -or
+        $queueDirectory.StartsWith($resolvedInactiveRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+    if (-not $allowedDirectory) { throw "Refusing to rename a queue outside the managed queue directories: $oldPath" }
+    $fileName = if ($script:State.SetId -eq 'default') {
+        "$($script:State.Game).$stage - $newName.biq2"
+    } else {
+        "$($script:State.Game).$($script:State.SetId).$stage - $newName.biq2"
+    }
+    $newPath = Join-Path $queueDirectory $fileName
+    if ($newPath -ine $oldPath -and (Test-Path -LiteralPath $newPath)) {
+        [System.Windows.Forms.MessageBox]::Show('A queue file with the resulting name already exists.', 'Queue file already exists', 'OK', 'Error')
+        return
+    }
+
+    $queueName = if ($script:State.SetId -eq 'default') {
+        "$($script:State.Game).$stage - $newName"
+    } else {
+        "$($script:State.Game) [$($script:State.SetName)] $stage - $newName"
+    }
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        "Rename queue '$oldName' to '$newName'?`r`n`r`nThe queue contents and install order will not change. A backup will be created first.",
+        'Confirm queue rename',
+        'YesNo',
+        'Question'
+    )
+    if ($answer -ne 'Yes') { return }
+
+    $backupRoot = Join-Path $script:QueueRoot ("OrganizerBackups\{0}-rename-{1}-{2}-{3}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $script:State.Game, $script:State.SetId, $stage)
+    [void](New-Item -ItemType Directory -Path $backupRoot -Force)
+    Copy-Item -LiteralPath $oldPath -Destination (Join-Path $backupRoot (Split-Path $oldPath -Leaf))
+
+    $queueInfo.Data.queuename = $queueName
+    $queueInfo.Data.organizerName = $newName
+    $queueInfo.Data.description = "Organizer-managed install group: $newName"
+    $queueInfo.Data.ImporterDescription = "Organizer-managed $($script:State.Game) install group: $newName.`r`n`r`nImporting will add this install group to Batch Installer. This does not import any listed mods."
+    $json = ($queueInfo.Data | ConvertTo-Json -Depth 30) + [Environment]::NewLine
+    if ($newPath -ieq $oldPath) {
+        [System.IO.File]::WriteAllText($oldPath, $json, [System.Text.UTF8Encoding]::new($false))
+        $fileName = Split-Path $oldPath -Leaf
+    } else {
+        [System.IO.File]::WriteAllText($newPath, $json, [System.Text.UTF8Encoding]::new($false))
+        Remove-Item -LiteralPath $oldPath
+    }
+    Set-QueueRegistryEntry -Game $script:State.Game -SetId $script:State.SetId -SetName $script:State.SetName -Order $stage -Name $newName -QueueName $queueName -FileName $fileName
+    Save-QueueRegistry
+    $script:State = Get-GameState -Game $script:State.Game -SetId $script:State.SetId
+    Refresh-QueueSelectors
+    for ($index = 1; $index -lt $queueFilterBox.Items.Count; $index++) {
+        if ([int]$queueFilterBox.Items[$index].Stage -eq $stage) { $queueFilterBox.SelectedIndex = $index; break }
+    }
+    Refresh-List
+    [System.Windows.Forms.MessageBox]::Show("Queue renamed.`r`n`r`nBackup:`r`n$backupRoot", 'Queue renamed', 'OK', 'Information')
+}
+
 function Show-BackupManager {
     $backupRoot = Join-Path $script:QueueRoot 'OrganizerBackups'
     [void](New-Item -ItemType Directory -Path $backupRoot -Force)
@@ -1653,6 +2575,7 @@ function Move-SelectedMods {
         }
     }
     for ($index = 0; $index -lt $ordered.Count; $index++) { $ordered[$index].QueueOrders[$stage] = $index }
+    Clear-AutoSortReview -State $script:State
     $script:State.Dirty = $true
     Update-StateStatus -State $script:State
     $sortBox.SelectedIndex = 1
@@ -1682,10 +2605,122 @@ function Set-QueueOrderByMountId {
         @{ Expression = { if ($_.Facts.MountIds.Count) { [int](($_.Facts.MountIds | Measure-Object -Minimum).Minimum) } else { [int]::MaxValue } } }, `
         @{ Expression = { $_.Name } })
     for ($index = 0; $index -lt $ordered.Count; $index++) { $ordered[$index].QueueOrders[$stage] = $index }
+    Clear-AutoSortReview -State $script:State
     $script:State.Dirty = $true
     Update-StateStatus -State $script:State
     $sortBox.SelectedIndex = 1
     Refresh-List
+}
+
+function Show-AutoSortSummary {
+    param($Plan, [string]$ScopeText)
+
+    $reviewKeys = @($Plan.Review.Keys)
+    $edgeCount = if ($null -eq $Plan.EdgeCount) { 0 } else { [int]$Plan.EdgeCount }
+    $message = "Auto-sort completed for $ScopeText.`r`n`r`n$($Plan.Ordered.Count) mods sorted using $edgeCount dependency relationships."
+    if (-not $reviewKeys.Count) {
+        $message += "`r`n`r`nNo unresolved ordering cases were found."
+        [System.Windows.Forms.MessageBox]::Show($message, 'Auto-sort completed', 'OK', 'Information')
+        return
+    }
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in @($reviewKeys | Sort-Object { $script:State.Records[$_].Name } | Select-Object -First 20)) {
+        $record = $script:State.Records[$key]
+        $lines.Add("- $($record.Name): $(@($Plan.Review[$key] | Sort-Object) -join '; ')")
+    }
+    if ($reviewKeys.Count -gt 20) { $lines.Add("- ... and $($reviewKeys.Count - 20) more") }
+    $message += "`r`n`r`n$($reviewKeys.Count) mods need manual review and are marked yellow:`r`n`r`n$($lines -join "`r`n")"
+    [System.Windows.Forms.MessageBox]::Show($message, 'Auto-sort completed with review items', 'OK', 'Warning')
+}
+
+function Invoke-DependencyAutoSort {
+    param([ValidateSet('Queue', 'Set')][string]$Mode)
+
+    if (-not $script:State -or $script:State.Game -eq 'All' -or $asiEditToggle.Checked -or $creationEditToggle.Checked) { return }
+    $selectedKeys = @{}; foreach ($item in $list.SelectedItems) { $selectedKeys[$item.Tag.Key] = $true }
+
+    if ($Mode -eq 'Queue') {
+        if ($queueFilterBox.SelectedIndex -le 0 -or [int]$queueFilterBox.SelectedItem.Stage -le 0) { return }
+        $stage = [int]$queueFilterBox.SelectedItem.Stage
+        $queueName = "$($script:State.Game).$stage - $($script:State.StageNames[[string]$stage])"
+        $records = @($script:State.Records.Values | Where-Object { $null -ne $_.Target -and [int]$_.Target -eq $stage })
+        if ($records.Count -lt 2) {
+            [System.Windows.Forms.MessageBox]::Show("$queueName contains fewer than two mods, so there is nothing to sort.", 'Auto-sort', 'OK', 'Information')
+            return
+        }
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "This will overwrite the manual order of every mod in:`r`n`r`n$queueName`r`n`r`nDependencies and local rules take priority. Mount ID and mod name are used as the baseline where no dependency dictates the order.`r`n`r`nChanges remain unsaved until you click Save queues. Continue?",
+            'Dependency-aware auto-sort', 'YesNo', 'Warning')
+        if ($answer -ne 'Yes') { return }
+
+        $plan = Get-AutoSortPlan -State $script:State -Records $records
+        for ($index = 0; $index -lt $plan.Ordered.Count; $index++) { $plan.Ordered[$index].QueueOrders[$stage] = $index }
+        Set-AutoSortReview -State $script:State -Plan $plan
+        $script:State.Dirty = $true
+        Update-StateStatus -State $script:State
+        $sortBox.SelectedIndex = 1
+        Refresh-List -PreserveSelection $selectedKeys -PreserveViewport
+        Show-AutoSortSummary -Plan $plan -ScopeText $queueName
+        return
+    }
+
+    $stages = @($script:State.StageNames.Keys | Where-Object { [int]$_ -gt 0 } | Sort-Object { [int]$_ } | ForEach-Object { [int]$_ })
+    $records = @($script:State.Records.Values | Where-Object { $null -ne $_.Target })
+    if ($records.Count -lt 2 -or -not $stages.Count) {
+        [System.Windows.Forms.MessageBox]::Show('The current set contains fewer than two assigned mods, so there is nothing to sort.', 'Advanced auto-sort', 'OK', 'Information')
+        return
+    }
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        "ADVANCED OPTION`r`n`r`nThis can move mods between every working queue in the '$($script:State.SetName)' set for $($script:State.Game). Existing queue categories and names may no longer match their contents.`r`n`r`nThe Creation List is not changed. Existing mod counts per queue are retained, but all working queue assignments and manual orders are rebuilt from the dependency-aware result.`r`n`r`nChanges remain unsaved until you click Save queues; Reload discards them. Continue?",
+        'Advanced cross-queue auto-sort', 'YesNo', 'Warning')
+    if ($answer -ne 'Yes') { return }
+
+    $stageCounts = @{}
+    foreach ($stage in $stages) { $stageCounts[$stage] = @($records | Where-Object { [int]$_.Target -eq $stage }).Count }
+    $plan = Get-AutoSortPlan -State $script:State -Records $records
+    foreach ($record in $records) {
+        foreach ($queueOrderStage in @($record.QueueOrders.Keys | Where-Object { [int]$_ -gt 0 })) { $record.QueueOrders.Remove($queueOrderStage) }
+    }
+    $recordIndex = 0
+    foreach ($stage in $stages) {
+        for ($queueIndex = 0; $queueIndex -lt $stageCounts[$stage]; $queueIndex++) {
+            $record = $plan.Ordered[$recordIndex++]
+            $record.Target = [Nullable[int]]$stage
+            $record.Memberships.Clear()
+            $record.Memberships.Add($stage)
+            $record.QueueOrders[$stage] = $queueIndex
+        }
+    }
+    Set-AutoSortReview -State $script:State -Plan $plan
+    $script:State.Dirty = $true
+    Update-StateStatus -State $script:State
+    $sortBox.SelectedIndex = 1
+    Refresh-List -PreserveSelection $selectedKeys -PreserveViewport
+    Show-AutoSortSummary -Plan $plan -ScopeText "$($script:State.Game) set '$($script:State.SetName)'"
+}
+
+function Show-AutoSortDialog {
+    if (-not $script:State -or $script:State.Game -eq 'All' -or $asiEditToggle.Checked -or $creationEditToggle.Checked) { return }
+    $hasCurrentQueue = $queueFilterBox.SelectedIndex -gt 0 -and [int]$queueFilterBox.SelectedItem.Stage -gt 0
+    $currentQueueName = if ($hasCurrentQueue) { [string]$queueFilterBox.SelectedItem.Text } else { 'Select a specific queue in the queue filter first.' }
+
+    $dialog = [System.Windows.Forms.Form]@{ Text = 'Dependency-aware auto-sort'; Width = 650; Height = 370; StartPosition = 'CenterParent'; MinimizeBox = $false; MaximizeBox = $false; FormBorderStyle = 'FixedDialog' }
+    if (Test-Path -LiteralPath $iconPath) { $dialog.Icon = [System.Drawing.Icon]::new($iconPath) }
+    $intro = [System.Windows.Forms.Label]@{ Text = 'Choose how broadly the organizer may change the order. Dependencies and local rules take priority; Mount ID and name provide the remaining baseline order.'; Left = 18; Top = 18; Width = 595; Height = 48 }
+    $queueRadio = [System.Windows.Forms.RadioButton]@{ Text = 'Sort only the currently filtered queue (recommended)'; Left = 18; Top = 76; Width = 595; Height = 24; Enabled = $hasCurrentQueue; Checked = $hasCurrentQueue }
+    $queueDescription = [System.Windows.Forms.Label]@{ Text = $currentQueueName; Left = 40; Top = 103; Width = 570; Height = 30; ForeColor = [System.Drawing.Color]::DimGray }
+    $setRadio = [System.Windows.Forms.RadioButton]@{ Text = 'Advanced: sort across all working queues for this game in the current set'; Left = 18; Top = 145; Width = 595; Height = 24; Checked = -not $hasCurrentQueue }
+    $setDescription = [System.Windows.Forms.Label]@{ Text = 'This can move mods between queues and may make their category names inaccurate. Queue sizes are retained. The Creation List remains untouched.'; Left = 40; Top = 173; Width = 570; Height = 52; ForeColor = [System.Drawing.Color]::DarkRed }
+    $reviewHint = [System.Windows.Forms.Label]@{ Text = 'Ambiguous, missing, or cyclic dependencies are placed as late as possible, marked yellow, and listed after sorting.'; Left = 18; Top = 232; Width = 595; Height = 42 }
+    $startButton = [System.Windows.Forms.Button]@{ Text = 'Continue'; Left = 405; Top = 285; Width = 100; Height = 32; DialogResult = 'OK' }
+    $cancelButton = [System.Windows.Forms.Button]@{ Text = 'Cancel'; Left = 515; Top = 285; Width = 100; Height = 32; DialogResult = 'Cancel' }
+    $dialog.Controls.AddRange(@($intro, $queueRadio, $queueDescription, $setRadio, $setDescription, $reviewHint, $startButton, $cancelButton))
+    $dialog.AcceptButton = $startButton; $dialog.CancelButton = $cancelButton
+    $result = $dialog.ShowDialog($form)
+    $mode = if ($queueRadio.Checked) { 'Queue' } else { 'Set' }
+    $dialog.Dispose()
+    if ($result -eq 'OK') { Invoke-DependencyAutoSort -Mode $mode }
 }
 
 function Update-MoveButtons {
@@ -1693,6 +2728,7 @@ function Update-MoveButtons {
     $moveUpButton.Enabled = $enabled
     $moveDownButton.Enabled = $enabled
     $mountOrderButton.Enabled = $enabled
+    $dependencySortButton.Enabled = -not $asiEditToggle.Checked -and $script:State -and $script:State.Game -ne 'All' -and -not $creationEditToggle.Checked -and @($script:State.StageNames.Keys | Where-Object { [int]$_ -gt 0 }).Count -gt 0
 }
 
 $list.add_ItemDrag({
@@ -1732,6 +2768,7 @@ $list.add_DragDrop({ param($sender, $eventArgs)
     }
     if ($insertIndex -ge $remaining.Count) { foreach ($record in $selectedRecords) { $newOrder.Add($record) } }
     for ($index = 0; $index -lt $newOrder.Count; $index++) { $newOrder[$index].QueueOrders[$stage] = $index }
+    Clear-AutoSortReview -State $script:State
     $script:State.Dirty = $true
     Update-StateStatus -State $script:State
     Refresh-List -PreserveSelection $selectedKeys
@@ -1741,9 +2778,10 @@ $list.add_SelectedIndexChanged({
     if ($list.SelectedItems.Count -eq 0) {
         $script:UpdatingCreationToggle = $true; $creationToggle.CheckState = 'Unchecked'; $script:UpdatingCreationToggle = $false
         $selectedLabel.Text = if ($asiEditToggle.Checked) { 'No ASI plugin selected' } else { 'No mod selected' }
-        $pathLabel.Text = ''; $dependencyBox.Text = ''; Set-NexusLink; Update-AssignButtonState; return
+        $pathLabel.Text = ''; $dependencyBox.Text = ''; $manageRulesButton.Enabled = $false; Set-NexusLink; Update-AssignButtonState; return
     }
     $records = @($list.SelectedItems | ForEach-Object { $_.Tag })
+    $manageRulesButton.Enabled = -not $asiEditToggle.Checked -and $records.Count -eq 1 -and $records[0].Facts.Exists
     if ($asiEditToggle.Checked) {
         Set-NexusLink
         $selectedLabel.Text = if ($records.Count -eq 1) { $records[0].Name } else { "$($records.Count) ASI plugins selected" }
@@ -1778,9 +2816,10 @@ $list.add_SelectedIndexChanged({
             }
         }
         $shownOrder = if ($creationEditToggle.Checked) { if ($record.InCreation) { (Get-RecordCreationOrder $record) + 1 } else { 'Not in Creation' } } elseif ($null -ne $record.Target) { (Get-RecordQueueOrder $record) + 1 } else { 'Unassigned' }
-        $dependencyBox.Text = "Creation queue: $(if($record.InCreation){'Yes'}else{'No'})`r`nMount ID: $(if($record.Facts.MountIds.Count){$record.Facts.MountIds -join ', '}else{'None'})`r`nQueue order: $shownOrder`r`n`r`nStatus:`r`n$($record.Status)`r`n`r`nProvides:`r`n$(if($record.Facts.Provided.Count){$record.Facts.Provided -join "`r`n"}else{'None'})`r`n`r`nRequired dependencies:`r`n$(if($record.Facts.Required.Count){$record.Facts.Required -join "`r`n"}else{'None'})`r`n`r`nOptional or patch detection:`r`n$(if($record.Facts.Conditional.Count){$record.Facts.Conditional -join "`r`n"}else{'None'})`r`n`r`nIncompatible DLC:`r`n$(if($record.Facts.Incompatible.Count){$record.Facts.Incompatible -join "`r`n"}else{'None'})`r`n`r`nDescription:`r`n$(if($record.Facts.Description){$record.Facts.Description}else{'No description available.'})"
+        $dependencyBox.Text = "Creation queue: $(if($record.InCreation){'Yes'}else{'No'})`r`nMod version: $(if($record.Facts.ModVersion){$record.Facts.ModVersion}else{'Unknown'})`r`nMount ID: $(if($record.Facts.MountIds.Count){$record.Facts.MountIds -join ', '}else{'None'})`r`nQueue order: $shownOrder`r`n`r`nStatus:`r`n$($record.Status)`r`n`r`nProvides:`r`n$(if($record.Facts.Provided.Count){$record.Facts.Provided -join "`r`n"}else{'None'})`r`n`r`nRequired dependencies:`r`n$(if($record.Facts.Required.Count){$record.Facts.Required -join "`r`n"}else{'None'})`r`n`r`nOptional or patch detection:`r`n$(if($record.Facts.Conditional.Count){$record.Facts.Conditional -join "`r`n"}else{'None'})`r`n`r`nIncompatible DLC:`r`n$(if($record.Facts.Incompatible.Count){$record.Facts.Incompatible -join "`r`n"}else{'None'})`r`n`r`nLocal organizer rules:`r`n$(Get-LocalRuleDetailsText $record)`r`n`r`nDescription:`r`n$(if($record.Facts.Description){$record.Facts.Description}else{'No description available.'})"
     } else {
         $pathLabel.Text = ''; $targetBox.SelectedIndex = 0
+        $manageRulesButton.Enabled = $false
         Set-NexusLink
         $dependencyBox.Text = 'The selected target queue will be applied to every selected mod.'
     }
@@ -1839,6 +2878,8 @@ $creationToggle.add_CheckStateChanged({
         }
         if (-not $addToCreation) { [void]$record.QueueOrders.Remove(0) }
     }
+    Clear-AutoSortReview -State $script:State
+    Update-StateStatus -State $script:State
     $script:State.Dirty = $true
     Refresh-List -PreserveSelection $selectedKeys
 })
@@ -1936,11 +2977,14 @@ $assignButton.add_Click({
     Refresh-List -PreserveSelection $selectedKeys -PreserveViewport
 })
 $newQueueButton.add_Click({ New-ManagedQueue })
+$renameQueueButton.add_Click({ Rename-FilteredQueue })
+$manageRulesButton.add_Click({ Show-LocalRuleManager })
 $deleteQueueButton.add_Click({ Remove-FilteredQueue })
 $backupButton.add_Click({ Show-BackupManager })
 $moveUpButton.add_Click({ Move-SelectedMods -Direction Up })
 $moveDownButton.add_Click({ Move-SelectedMods -Direction Down })
 $mountOrderButton.add_Click({ Set-QueueOrderByMountId })
+$dependencySortButton.add_Click({ Show-AutoSortDialog })
 $newSetButton.add_Click({ New-OrganizerSet })
 $renameSetButton.add_Click({ Rename-OrganizerSet })
 $deleteSetButton.add_Click({ Remove-OrganizerSet })
