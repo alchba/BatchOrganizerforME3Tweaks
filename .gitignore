@@ -1,5 +1,9 @@
 # User-specific Organizer data
 Organizer*.json
+OrganizerQueueSets/
+OrganizerBackups/
+OrganizerMigrationArchive/
+OrganizerDeletedMods/
 
 # Distribution and compiled output
 distribute/

@@ -1,11 +1,13 @@
 param(
     [string]$ModsRoot = '',
     [string]$StorageRoot = '',
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [switch]$UiSmokeTest,
+    [string]$UiSmokeScreenshot = ''
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.0.3'
+$script:AppVersion = '1.1.0'
 
 $script:DefaultStageNames = [ordered]@{
     '0' = 'Creation Mods List'
@@ -20,12 +22,17 @@ $script:DefaultStageNames = [ordered]@{
 $script:StageNames = [ordered]@{}
 $script:ManagedQueueFiles = @{}
 $script:State = $null
+$script:QueueStorageInitialized = $false
 $script:StorageRoot = if ([string]::IsNullOrWhiteSpace($StorageRoot)) { $PSScriptRoot } else { [System.IO.Path]::GetFullPath($StorageRoot) }
 $script:SettingsPath = Join-Path $script:StorageRoot 'OrganizerSettings.json'
 $script:QueueRegistryPath = Join-Path $script:StorageRoot 'OrganizerQueues.json'
 $script:SetRegistryPath = Join-Path $script:StorageRoot 'OrganizerSets.json'
 $script:RemovedMissingModsPath = Join-Path $script:StorageRoot 'OrganizerRemovedMissingMods.json'
 $script:CustomRulesPath = Join-Path $script:StorageRoot 'OrganizerCustomRules.json'
+$script:OrganizerQueueStoreRoot = Join-Path $script:StorageRoot 'OrganizerQueueSets'
+$script:BackupRoot = Join-Path $script:StorageRoot 'OrganizerBackups'
+$script:MigrationArchiveRoot = Join-Path $script:StorageRoot 'OrganizerMigrationArchive'
+$script:DeletedModsRoot = Join-Path $script:StorageRoot 'OrganizerDeletedMods'
 $script:CustomRules = @()
 $script:CustomRulesLoadError = ''
 $script:QueueRegistry = if (Test-Path -LiteralPath $script:QueueRegistryPath) {
@@ -91,6 +98,7 @@ $script:WindowSettings = if (Test-Path -LiteralPath $script:SettingsPath) {
 $script:ModManagerRoot = $null
 $script:QueueRoot = $null
 $script:InactiveQueueRoot = $null
+$script:LegacyInactiveQueueRoot = $null
 
 function Save-QueueRegistry {
     $ordered = @($script:QueueRegistry | Sort-Object Game, SetId, Order)
@@ -252,7 +260,8 @@ function Set-ModManagerRoot {
     $script:ModManagerRoot = $resolved
     $script:ModsRoot = Join-Path $resolved 'mods'
     $script:QueueRoot = Join-Path $script:ModsRoot 'BatchModQueues'
-    $script:InactiveQueueRoot = Join-Path $script:QueueRoot 'OrganizerQueueSets'
+    $script:InactiveQueueRoot = $script:OrganizerQueueStoreRoot
+    $script:LegacyInactiveQueueRoot = Join-Path $script:QueueRoot 'OrganizerQueueSets'
     Set-Variable -Name ModsRoot -Scope Script -Value $script:ModsRoot
 }
 
@@ -338,6 +347,207 @@ function Set-AsiRecordQueueMembership {
     Update-AsiRecordStatus -Record $Record
 }
 
+function Get-OrganizerQueueStoreDirectory {
+    param([ValidateSet('LE1', 'LE2', 'LE3')][string]$Game, [string]$SetId)
+    $safeSetId = if ([string]::IsNullOrWhiteSpace($SetId)) { 'default' } else { $SetId.Trim() }
+    if ($safeSetId -in @('.', '..') -or $safeSetId.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $safeSetId.Contains([System.IO.Path]::DirectorySeparatorChar) -or $safeSetId.Contains([System.IO.Path]::AltDirectorySeparatorChar)) {
+        throw "Invalid Organizer set identifier: $SetId"
+    }
+    return Join-Path (Join-Path $script:OrganizerQueueStoreRoot $Game) $safeSetId
+}
+
+function Get-OrganizerQueueStorePath {
+    param($Entry)
+    $fileName = [string]$Entry.FileName
+    if ([string]::IsNullOrWhiteSpace($fileName) -or [System.IO.Path]::GetFileName($fileName) -cne $fileName) { throw "Invalid Organizer queue file name: $fileName" }
+    $setId = if ([int]$Entry.Order -eq 0) { 'creation' } elseif ($Entry.SetId) { [string]$Entry.SetId } else { 'default' }
+    return Join-Path (Get-OrganizerQueueStoreDirectory -Game ([string]$Entry.Game) -SetId $setId) $fileName
+}
+
+function Get-OrganizerQueueIdentity {
+    param([System.IO.FileInfo]$File, $Data)
+    if ($null -eq $File -or $null -eq $Data) { return $null }
+    $queueName = [string]$Data.queuename
+    $registryEntry = @($script:QueueRegistry | Where-Object { $_.FileName -ieq $File.Name } | Select-Object -First 1)
+    $registryFileNameMatch = $registryEntry.Count -gt 0
+    if (-not $registryEntry.Count -and -not [string]::IsNullOrWhiteSpace($queueName)) {
+        $registryEntry = @($script:QueueRegistry | Where-Object { $_.QueueName -ieq $queueName } | Select-Object -First 1)
+    }
+    if ($Data.organizerManaged -ne $true -and -not $registryEntry.Count) { return $null }
+    $game = if ($registryEntry.Count) { [string]$registryEntry[0].Game } else { ([string]$Data.game).ToUpperInvariant() }
+    if ($game -notin @('LE1', 'LE2', 'LE3')) { return $null }
+    $order = -1
+    if ($registryEntry.Count) { $order = [int]$registryEntry[0].Order }
+    elseif ($null -ne $Data.organizerOrder) { [void][int]::TryParse([string]$Data.organizerOrder, [ref]$order) }
+    if ($order -lt 0) { return $null }
+    $setId = if ($order -eq 0) { 'creation' } elseif ($registryEntry.Count -and $registryEntry[0].SetId) { [string]$registryEntry[0].SetId } elseif ($Data.organizerSetId) { [string]$Data.organizerSetId } else { 'default' }
+    $setName = if ($order -eq 0) { 'Creation List' } elseif ($registryEntry.Count -and $registryEntry[0].SetName) { [string]$registryEntry[0].SetName } elseif ($Data.organizerSetName) { [string]$Data.organizerSetName } elseif ($setId -eq 'default') { 'Default' } else { $setId }
+    $name = if ($registryEntry.Count) { [string]$registryEntry[0].Name } elseif ($Data.organizerName) { [string]$Data.organizerName } else { $queueName }
+    $canonicalFileName = if ($registryEntry.Count -and $registryEntry[0].FileName) { [string]$registryEntry[0].FileName } else { $File.Name }
+    if ([System.IO.Path]::GetFileName($canonicalFileName) -cne $canonicalFileName) { return $null }
+    return [pscustomobject]@{
+        Game = $game
+        Order = $order
+        SetId = $setId
+        SetName = $setName
+        Name = $name
+        QueueName = $queueName
+        FileName = $canonicalFileName
+        RegistryFileNameMatch = $registryFileNameMatch
+        OrganizerManaged = $Data.organizerManaged -eq $true
+        Key = "$game|$setId|$order"
+    }
+}
+
+function Set-OrganizerQueueMetadata {
+    param($Data, $Identity)
+    $Data | Add-Member -NotePropertyName organizerManaged -NotePropertyValue $true -Force
+    $Data | Add-Member -NotePropertyName organizerOrder -NotePropertyValue ([int]$Identity.Order) -Force
+    $Data | Add-Member -NotePropertyName organizerName -NotePropertyValue ([string]$Identity.Name) -Force
+    $Data | Add-Member -NotePropertyName organizerRole -NotePropertyValue $(if ([int]$Identity.Order -eq 0) { 'Creation' } else { 'Assignment' }) -Force
+    $Data | Add-Member -NotePropertyName organizerSetId -NotePropertyValue ([string]$Identity.SetId) -Force
+    $Data | Add-Member -NotePropertyName organizerSetName -NotePropertyValue ([string]$Identity.SetName) -Force
+}
+
+function Get-UniqueOrganizerArchivePath {
+    param([string]$ArchiveRoot, [string]$FileName)
+    [void](New-Item -ItemType Directory -Path $ArchiveRoot -Force)
+    $safeName = [System.IO.Path]::GetFileName($FileName)
+    $candidate = Join-Path $ArchiveRoot $safeName
+    $counter = 1
+    while (Test-Path -LiteralPath $candidate) {
+        $candidate = Join-Path $ArchiveRoot ("{0}-{1}{2}" -f [System.IO.Path]::GetFileNameWithoutExtension($safeName), $counter, [System.IO.Path]::GetExtension($safeName))
+        $counter++
+    }
+    return $candidate
+}
+
+function Sync-ActiveOrganizerQueues {
+    param([string]$ActiveSetId = (Get-ActiveSetId))
+    [void](New-Item -ItemType Directory -Path $script:QueueRoot -Force)
+    $publishedEntries = @($script:QueueRegistry | Where-Object { [int]$_.Order -eq 0 -or $_.SetId -eq $ActiveSetId })
+    $sources = @{}
+    foreach ($entry in $publishedEntries) {
+        $source = Get-OrganizerQueueStorePath -Entry $entry
+        if (Test-Path -LiteralPath $source -PathType Leaf) { $sources[[string]$entry.FileName] = $source }
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath $script:QueueRoot -Filter '*.biq2' -File)) {
+        try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        $identity = Get-OrganizerQueueIdentity -File $file -Data $data
+        if ($null -eq $identity) { continue }
+        if (-not $sources.ContainsKey($file.Name)) { Remove-Item -LiteralPath $file.FullName }
+    }
+    foreach ($fileName in $sources.Keys) {
+        Copy-Item -LiteralPath $sources[$fileName] -Destination (Join-Path $script:QueueRoot $fileName) -Force
+    }
+}
+
+function Initialize-OrganizerQueueStorage {
+    if (-not $script:QueueRoot -or $script:QueueStorageInitialized) { return }
+    [void](New-Item -ItemType Directory -Path $script:OrganizerQueueStoreRoot -Force)
+    [void](New-Item -ItemType Directory -Path $script:BackupRoot -Force)
+    [void](New-Item -ItemType Directory -Path $script:QueueRoot -Force)
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $archiveSessionRoot = Join-Path $script:MigrationArchiveRoot $stamp
+    $migratedQueues = 0
+    $archivedDuplicates = 0
+    $migratedBackups = 0
+
+    $legacyBackupRoot = Join-Path $script:QueueRoot 'OrganizerBackups'
+    if (Test-Path -LiteralPath $legacyBackupRoot -PathType Container) {
+        foreach ($directory in @(Get-ChildItem -LiteralPath $legacyBackupRoot -Directory)) {
+            $destination = Join-Path $script:BackupRoot $directory.Name
+            if (Test-Path -LiteralPath $destination) {
+                $destination = Get-UniqueOrganizerArchivePath -ArchiveRoot $script:BackupRoot -FileName $directory.Name
+            }
+            Move-Item -LiteralPath $directory.FullName -Destination $destination
+            $migratedBackups++
+        }
+        $looseFiles = @(Get-ChildItem -LiteralPath $legacyBackupRoot -File)
+        if ($looseFiles.Count) {
+            $looseDestination = Join-Path $script:BackupRoot "$stamp-migrated-loose-backup-files"
+            [void](New-Item -ItemType Directory -Path $looseDestination -Force)
+            foreach ($file in $looseFiles) { Move-Item -LiteralPath $file.FullName -Destination (Get-UniqueOrganizerArchivePath -ArchiveRoot $looseDestination -FileName $file.Name) }
+            $migratedBackups++
+        }
+        if (-not @(Get-ChildItem -LiteralPath $legacyBackupRoot -Force).Count) { Remove-Item -LiteralPath $legacyBackupRoot }
+    }
+
+    $candidateFiles = [System.Collections.Generic.List[object]]::new()
+    foreach ($file in @(Get-ChildItem -LiteralPath $script:QueueRoot -Filter '*.biq2' -File -Recurse)) {
+        try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        $identity = Get-OrganizerQueueIdentity -File $file -Data $data
+        if ($null -eq $identity) { continue }
+        $candidateFiles.Add([pscustomobject]@{
+            File = $file; Data = $data; Identity = $identity; IsInternal = $false
+            IsTopLevel = $file.DirectoryName -ieq $script:QueueRoot
+        })
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath $script:OrganizerQueueStoreRoot -Filter '*.biq2' -File -Recurse)) {
+        try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        $identity = Get-OrganizerQueueIdentity -File $file -Data $data
+        if ($null -eq $identity) { continue }
+        $candidateFiles.Add([pscustomobject]@{ File = $file; Data = $data; Identity = $identity; IsInternal = $true; IsTopLevel = $false })
+    }
+
+    foreach ($group in @($candidateFiles | Group-Object { $_.Identity.Key })) {
+        $ordered = @($group.Group | Sort-Object `
+            @{ Expression = { if ($_.IsInternal) { 0 } else { 1 } } }, `
+            @{ Expression = { if ($_.Identity.RegistryFileNameMatch) { 0 } else { 1 } } }, `
+            @{ Expression = { if ($_.Identity.OrganizerManaged) { 0 } else { 1 } } }, `
+            @{ Expression = { if ($_.IsTopLevel) { 0 } else { 1 } } }, `
+            @{ Expression = { $_.File.LastWriteTimeUtc }; Descending = $true })
+        if (-not $ordered.Count) { continue }
+        $winner = $ordered[0]
+        $identity = $winner.Identity
+        $targetDirectory = Get-OrganizerQueueStoreDirectory -Game $identity.Game -SetId $identity.SetId
+        [void](New-Item -ItemType Directory -Path $targetDirectory -Force)
+        $targetPath = Join-Path $targetDirectory $identity.FileName
+        foreach ($candidate in $ordered) {
+            if ($candidate.File.FullName -ieq $winner.File.FullName) { continue }
+            $publishedProjection = $winner.IsInternal -and $candidate.IsTopLevel -and $candidate.File.Name -ieq $identity.FileName
+            if ($publishedProjection) {
+                $winnerHash = (Get-FileHash -LiteralPath $winner.File.FullName -Algorithm SHA256).Hash
+                $candidateHash = (Get-FileHash -LiteralPath $candidate.File.FullName -Algorithm SHA256).Hash
+                if ($winnerHash -eq $candidateHash) {
+                    Remove-Item -LiteralPath $candidate.File.FullName
+                    continue
+                }
+            }
+            $archiveRoot = Join-Path $archiveSessionRoot ("{0}\{1}\{2}" -f $identity.Game, $identity.SetId, $identity.Order)
+            $archivePath = Get-UniqueOrganizerArchivePath -ArchiveRoot $archiveRoot -FileName $candidate.File.Name
+            Move-Item -LiteralPath $candidate.File.FullName -Destination $archivePath
+            $archivedDuplicates++
+        }
+        if ($winner.File.FullName -ine $targetPath) {
+            if (Test-Path -LiteralPath $targetPath) {
+                $archiveRoot = Join-Path $archiveSessionRoot ("{0}\{1}\{2}" -f $identity.Game, $identity.SetId, $identity.Order)
+                $archivePath = Get-UniqueOrganizerArchivePath -ArchiveRoot $archiveRoot -FileName ([System.IO.Path]::GetFileName($targetPath))
+                Move-Item -LiteralPath $targetPath -Destination $archivePath
+                $archivedDuplicates++
+            }
+            Move-Item -LiteralPath $winner.File.FullName -Destination $targetPath
+            $migratedQueues++
+        }
+        Set-OrganizerQueueMetadata -Data $winner.Data -Identity $identity
+        [System.IO.File]::WriteAllText($targetPath, (($winner.Data | ConvertTo-Json -Depth 30) + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+        Set-QueueRegistryEntry -Game $identity.Game -SetId $identity.SetId -SetName $identity.SetName -Order ([int]$identity.Order) -Name $identity.Name -QueueName ([string]$winner.Data.queuename) -FileName $identity.FileName
+        if ([int]$identity.Order -gt 0) { Set-SetRegistryEntry -SetId $identity.SetId -Name $identity.SetName }
+    }
+    Save-QueueRegistry
+    Save-SetRegistry
+
+    if (Test-Path -LiteralPath $script:LegacyInactiveQueueRoot -PathType Container) {
+        foreach ($directory in @(Get-ChildItem -LiteralPath $script:LegacyInactiveQueueRoot -Directory -Recurse | Sort-Object { $_.FullName.Length } -Descending)) {
+            if (-not @(Get-ChildItem -LiteralPath $directory.FullName -Force).Count) { Remove-Item -LiteralPath $directory.FullName }
+        }
+        if (-not @(Get-ChildItem -LiteralPath $script:LegacyInactiveQueueRoot -Force).Count) { Remove-Item -LiteralPath $script:LegacyInactiveQueueRoot }
+    }
+    Sync-ActiveOrganizerQueues
+    $script:QueueMigrationSummary = [pscustomobject]@{ Queues = $migratedQueues; Duplicates = $archivedDuplicates; Backups = $migratedBackups; Archive = $(if ($archivedDuplicates) { $archiveSessionRoot } else { '' }) }
+    $script:QueueStorageInitialized = $true
+}
+
 function Initialize-ManagedQueues {
     param([ValidateSet('LE1', 'LE2', 'LE3')][string]$Game, [string]$SetId = 'default')
 
@@ -345,37 +555,18 @@ function Initialize-ManagedQueues {
     $script:ManagedQueueFiles = @{}
     $registryChanged = $false
     $setRegistryChanged = $false
-    $queueFiles = @(Get-ChildItem -LiteralPath $script:QueueRoot -Filter '*.biq2' -File)
-    if (Test-Path -LiteralPath $script:InactiveQueueRoot) { $queueFiles += @(Get-ChildItem -LiteralPath $script:InactiveQueueRoot -Filter '*.biq2' -File -Recurse) }
+    $queueFiles = if (Test-Path -LiteralPath $script:OrganizerQueueStoreRoot) { @(Get-ChildItem -LiteralPath $script:OrganizerQueueStoreRoot -Filter '*.biq2' -File -Recurse) } else { @() }
     foreach ($file in $queueFiles) {
         try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
-        if ($data.game -ne $Game) { continue }
-        $queueName = [string]$data.queuename
-        $registryEntry = @($script:QueueRegistry | Where-Object { $_.Game -eq $Game -and ($_.QueueName -eq $queueName -or $_.FileName -eq $file.Name) } | Select-Object -First 1)
-        $recoverableOrganizerQueue = $queueName -match "^$([regex]::Escape($Game))\.(\d+) - (.+)$"
-        $recoveredOrder = if ($recoverableOrganizerQueue) { [int]$matches[1] } else { -1 }
-        $recoveredName = if ($recoverableOrganizerQueue) { [string]$matches[2] } else { '' }
-        if ($data.organizerManaged -ne $true -and $registryEntry.Count -eq 0 -and -not $recoverableOrganizerQueue) { continue }
-        $order = if ($registryEntry.Count) { [int]$registryEntry[0].Order } elseif ($data.organizerManaged -eq $true -and $null -ne $data.organizerOrder) { [int]$data.organizerOrder } else { $recoveredOrder }
-        $name = if ($registryEntry.Count) { [string]$registryEntry[0].Name } elseif ($data.organizerName) { [string]$data.organizerName } elseif ($recoverableOrganizerQueue) { $recoveredName } else { ($queueName -replace "^$Game\.$order - ", '') }
-        $queueSetId = if ($order -eq 0) { 'creation' } elseif ($registryEntry.Count -and $registryEntry[0].SetId) { [string]$registryEntry[0].SetId } elseif ($data.organizerSetId) { [string]$data.organizerSetId } else { 'default' }
-        $queueSetName = if ($order -eq 0) { 'Creation List' } elseif ($registryEntry.Count -and $registryEntry[0].SetName) { [string]$registryEntry[0].SetName } elseif ($data.organizerSetName) { [string]$data.organizerSetName } elseif ($queueSetId -eq 'default') { 'Default' } else { $queueSetId }
-        $data | Add-Member -NotePropertyName organizerManaged -NotePropertyValue $true -Force
-        $data | Add-Member -NotePropertyName organizerOrder -NotePropertyValue $order -Force
-        $data | Add-Member -NotePropertyName organizerName -NotePropertyValue $name -Force
-        $data | Add-Member -NotePropertyName organizerRole -NotePropertyValue $(if ($order -eq 0) { 'Creation' } else { 'Assignment' }) -Force
-        $data | Add-Member -NotePropertyName organizerSetId -NotePropertyValue $queueSetId -Force
-        $data | Add-Member -NotePropertyName organizerSetName -NotePropertyValue $queueSetName -Force
-        if ($order -gt 0) { Set-SetRegistryEntry -SetId $queueSetId -Name $queueSetName; $setRegistryChanged = $true }
-        if ($order -gt 0 -and $queueSetId -ne $SetId) {
-            Set-QueueRegistryEntry -Game $Game -SetId $queueSetId -SetName $queueSetName -Order $order -Name $name -QueueName $queueName -FileName $file.Name
-            $registryChanged = $true
-            continue
-        }
-        $script:StageNames[[string]$order] = $name
-        $script:ManagedQueueFiles[$order] = $file.FullName
-        Set-QueueRegistryEntry -Game $Game -SetId $queueSetId -SetName $queueSetName -Order $order -Name $name -QueueName $queueName -FileName $file.Name
+        if ($data.game -ne $Game -or $data.organizerManaged -ne $true) { continue }
+        $identity = Get-OrganizerQueueIdentity -File $file -Data $data
+        if ($null -eq $identity) { continue }
+        if ([int]$identity.Order -gt 0) { Set-SetRegistryEntry -SetId $identity.SetId -Name $identity.SetName; $setRegistryChanged = $true }
+        Set-QueueRegistryEntry -Game $identity.Game -SetId $identity.SetId -SetName $identity.SetName -Order ([int]$identity.Order) -Name $identity.Name -QueueName ([string]$data.queuename) -FileName $identity.FileName
         $registryChanged = $true
+        if ([int]$identity.Order -gt 0 -and $identity.SetId -ne $SetId) { continue }
+        $script:StageNames[[string]$identity.Order] = $identity.Name
+        $script:ManagedQueueFiles[[int]$identity.Order] = $file.FullName
     }
     if (-not @($script:SetRegistry | Where-Object { $_.Id -eq 'default' }).Count) { Set-SetRegistryEntry -SetId 'default' -Name 'Default'; $setRegistryChanged = $true }
     if ($registryChanged) { Save-QueueRegistry }
@@ -384,29 +575,7 @@ function Initialize-ManagedQueues {
 
 function Set-ActiveOrganizerSet {
     param([string]$SetId)
-    [void](New-Item -ItemType Directory -Path $script:InactiveQueueRoot -Force)
-    foreach ($game in @('LE1', 'LE2', 'LE3')) {
-        $gameStore = Join-Path $script:InactiveQueueRoot $game
-        [void](New-Item -ItemType Directory -Path $gameStore -Force)
-        $entries = @($script:QueueRegistry | Where-Object { $_.Game -eq $game -and [int]$_.Order -gt 0 })
-        foreach ($entry in $entries) {
-            $entrySetId = if ($entry.SetId) { [string]$entry.SetId } else { 'default' }
-            $targetDirectory = if ($entrySetId -eq $SetId) { $script:QueueRoot } else { Join-Path $gameStore $entrySetId }
-            [void](New-Item -ItemType Directory -Path $targetDirectory -Force)
-            $destination = Join-Path $targetDirectory ([string]$entry.FileName)
-            $candidates = @()
-            $topCandidate = Join-Path $script:QueueRoot ([string]$entry.FileName)
-            if (Test-Path -LiteralPath $topCandidate) { $candidates += Get-Item -LiteralPath $topCandidate }
-            if (Test-Path -LiteralPath $script:InactiveQueueRoot) {
-                $candidates += @(Get-ChildItem -LiteralPath $script:InactiveQueueRoot -Filter ([string]$entry.FileName) -File -Recurse)
-            }
-            $source = @($candidates | Where-Object { $_.FullName -ne $destination } | Select-Object -First 1)
-            if ($source.Count) {
-                if (Test-Path -LiteralPath $destination) { throw "Cannot activate set because the destination already exists: $destination" }
-                Move-Item -LiteralPath $source[0].FullName -Destination $destination
-            }
-        }
-    }
+    Sync-ActiveOrganizerQueues -ActiveSetId $SetId
     Set-ActiveSetRegistryEntry -SetId $SetId
 }
 
@@ -792,11 +961,9 @@ function Get-AllOrganizerQueuedModKeys {
     param([ValidateSet('LE1', 'LE2', 'LE3')][string]$Game)
     $keys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($entry in @($script:QueueRegistry | Where-Object { $_.Game -eq $Game })) {
-        $candidatePaths = @(Join-Path $script:QueueRoot ([string]$entry.FileName))
-        if (Test-Path -LiteralPath $script:InactiveQueueRoot) { $candidatePaths += @(Get-ChildItem -LiteralPath $script:InactiveQueueRoot -Filter ([string]$entry.FileName) -File -Recurse | ForEach-Object { $_.FullName }) }
-        $path = @($candidatePaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
-        if (-not $path.Count) { continue }
-        try { $data = Get-Content -LiteralPath $path[0] -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        $path = Get-OrganizerQueueStorePath -Entry $entry
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        try { $data = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
         foreach ($mod in @($data.mods)) { if ($mod.moddescpath) { [void]$keys.Add(([string]$mod.moddescpath).ToLowerInvariant()) } }
     }
     return ,$keys
@@ -839,29 +1006,288 @@ function Add-AutoSortEdge {
     if ($Prerequisites[$AfterKey].Add($BeforeKey)) { [void]$Dependents[$BeforeKey].Add($AfterKey) }
 }
 
-function Get-AutoSortPlan {
-    param($State, [object[]]$Records)
+function Get-DependencyGraphModel {
+    param($State, [object[]]$Records = @())
 
-    $nodes = @{}
-    $prerequisites = @{}
-    $dependents = @{}
-    $review = @{}
-    foreach ($record in $Records) {
-        $nodes[$record.Key] = $record
-        $prerequisites[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        $dependents[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    }
+    $allRecords = @($State.Records.Values)
+    $scopeRecords = if ($Records.Count) { @($Records) } else { @($allRecords) }
+    $recordNodes = @{}
+    foreach ($record in $allRecords) { $recordNodes[[string]$record.Key] = $record }
+    $scopeNodes = @{}
+    foreach ($record in $scopeRecords) { $scopeNodes[[string]$record.Key] = $record }
+
     $providers = @{}
-    foreach ($record in $State.Records.Values) {
-        foreach ($dlc in $record.Facts.Provided) {
+    foreach ($record in $allRecords) {
+        foreach ($dlc in @($record.Facts.Provided | Where-Object { $_ })) {
             if (-not $providers.ContainsKey($dlc)) { $providers[$dlc] = [System.Collections.Generic.List[object]]::new() }
             $providers[$dlc].Add($record)
         }
     }
 
-    foreach ($record in $Records) {
-        foreach ($dlc in $record.Facts.Required) {
+    $stages = [System.Collections.Generic.List[object]]::new()
+    $stages.Add([pscustomobject]@{ Id = 'base'; Order = -1; Kind = 'BaseGame'; Name = 'Base Game' })
+    $creationName = if ($State.PSObject.Properties['StageNames'] -and $State.StageNames.Contains('0')) { [string]$State.StageNames['0'] } else { 'Creation List' }
+    $stages.Add([pscustomobject]@{ Id = 'creation'; Order = 0; Kind = 'Creation'; Name = $creationName })
+    $workingStageIds = @()
+    if ($State.PSObject.Properties['StageNames']) {
+        $workingStageIds = @($State.StageNames.Keys | Where-Object { [int]$_ -gt 0 } | Sort-Object { [int]$_ })
+    }
+    if (-not $workingStageIds.Count) {
+        $workingStageIds = @($allRecords | Where-Object { $null -ne $_.Target } | ForEach-Object { [int]$_.Target } | Sort-Object -Unique)
+    }
+    foreach ($stage in $workingStageIds) {
+        $stageName = if ($State.PSObject.Properties['StageNames'] -and $State.StageNames.Contains([string]$stage)) { [string]$State.StageNames[[string]$stage] } else { "Queue $stage" }
+        $stages.Add([pscustomobject]@{ Id = "queue:$stage"; Order = [int]$stage; Kind = 'WorkingQueue'; Name = $stageName })
+    }
+    $stages.Add([pscustomobject]@{ Id = 'unassigned'; Order = [int]::MaxValue; Kind = 'Unassigned'; Name = 'Unassigned' })
+
+    $occurrences = [System.Collections.Generic.List[object]]::new()
+    $occurrences.Add([pscustomobject]@{
+        Id = 'base'; RecordKey = ''; StageId = 'base'; Stage = -1; StageKind = 'BaseGame'; Order = 0
+        Name = 'Base Game'; Record = $null
+    })
+    foreach ($record in $allRecords) {
+        $hasOccurrence = $false
+        if ($record.InCreation) {
+            $creationOrder = if ($record.QueueOrders.ContainsKey(0)) { [int]$record.QueueOrders[0] } else { [int]::MaxValue }
+            $occurrences.Add([pscustomobject]@{
+                Id = "$($record.Key)|creation"; RecordKey = [string]$record.Key; StageId = 'creation'; Stage = 0
+                StageKind = 'Creation'; Order = $creationOrder; Name = [string]$record.Name; Record = $record
+            })
+            $hasOccurrence = $true
+        }
+        $workingOccurrences = @($record.Memberships | Where-Object { [int]$_ -gt 0 } | Sort-Object -Unique)
+        if (-not $workingOccurrences.Count -and $null -ne $record.Target) { $workingOccurrences = @([int]$record.Target) }
+        foreach ($stage in $workingOccurrences) {
+            $queueOrder = if ($record.QueueOrders.ContainsKey([int]$stage)) { [int]$record.QueueOrders[[int]$stage] } else { [int]::MaxValue }
+            $occurrences.Add([pscustomobject]@{
+                Id = "$($record.Key)|queue:$stage"; RecordKey = [string]$record.Key; StageId = "queue:$stage"; Stage = [int]$stage
+                StageKind = 'WorkingQueue'; Order = $queueOrder; Name = [string]$record.Name; Record = $record
+            })
+            $hasOccurrence = $true
+        }
+        if (-not $hasOccurrence) {
+            $occurrences.Add([pscustomobject]@{
+                Id = "$($record.Key)|unassigned"; RecordKey = [string]$record.Key; StageId = 'unassigned'; Stage = [int]::MaxValue
+                StageKind = 'Unassigned'; Order = [int]$record.ReferenceOrder; Name = [string]$record.Name; Record = $record
+            })
+        }
+    }
+
+    $edges = [System.Collections.Generic.List[object]]::new()
+    $edgesBySubject = @{}
+    $edgeKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $addEdge = {
+        param(
+            [string]$Relationship, [string]$SourceKind, $SubjectRecord, $TargetRecord,
+            [string]$TargetName, [string]$Dlc, [bool]$AffectsOrder, [bool]$Symmetric,
+            [bool]$VersionConditionKnown, [bool]$Applies, $RuleResolution
+        )
+        $subjectKey = if ($null -ne $SubjectRecord) { [string]$SubjectRecord.Key } else { '' }
+        $targetKey = if ($null -ne $TargetRecord) { [string]$TargetRecord.Key } else { '' }
+        $ruleId = if ($null -ne $RuleResolution -and $null -ne $RuleResolution.Rule) { [string]$RuleResolution.Rule.id } else { '' }
+        $edgeKey = "$Relationship|$SourceKind|$subjectKey|$targetKey|$Dlc|$ruleId"
+        if (-not $edgeKeys.Add($edgeKey)) { return }
+        $edge = [pscustomobject]@{
+            Id = $edgeKey
+            Relationship = $Relationship
+            SourceKind = $SourceKind
+            SubjectKey = $subjectKey
+            TargetKey = $targetKey
+            BeforeKey = $(if ($Relationship -eq 'IntegratedInto') { $subjectKey } else { $targetKey })
+            AfterKey = $(if ($Relationship -eq 'IntegratedInto') { $targetKey } else { $subjectKey })
+            SubjectRecord = $SubjectRecord
+            TargetRecord = $TargetRecord
+            TargetName = $TargetName
+            Dlc = $Dlc
+            AffectsOrder = $AffectsOrder
+            Symmetric = $Symmetric
+            MissingTarget = $null -eq $TargetRecord
+            VersionConditionKnown = $VersionConditionKnown
+            Applies = $Applies
+            RuleResolution = $RuleResolution
+        }
+        $edges.Add($edge)
+        if ($subjectKey) {
+            if (-not $edgesBySubject.ContainsKey($subjectKey)) { $edgesBySubject[$subjectKey] = [System.Collections.Generic.List[object]]::new() }
+            $edgesBySubject[$subjectKey].Add($edge)
+        }
+    }
+
+    foreach ($record in $allRecords) {
+        foreach ($dlc in @($record.Facts.Required | Where-Object { $_ })) {
             $candidates = @(if ($providers.ContainsKey($dlc)) { @($providers[$dlc] | Where-Object { $_.Key -ne $record.Key }) } else { @() })
+            if (-not $candidates.Count) {
+                & $addEdge 'Requires' 'Native' $record $null $dlc $dlc $true $false $true $true $null
+            } else {
+                foreach ($candidate in $candidates) { & $addEdge 'Requires' 'Native' $record $candidate ([string]$candidate.Name) $dlc $true $false $true $true $null }
+            }
+        }
+        foreach ($dlc in @($record.Facts.Conditional | Where-Object { $_ })) {
+            $candidates = @(if ($providers.ContainsKey($dlc)) { @($providers[$dlc] | Where-Object { $_.Key -ne $record.Key }) } else { @() })
+            foreach ($candidate in $candidates) { & $addEdge 'Compatibility' 'Native' $record $candidate ([string]$candidate.Name) $dlc $true $false $true $true $null }
+        }
+        foreach ($dlc in @($record.Facts.Incompatible | Where-Object { $_ })) {
+            $candidates = @(if ($providers.ContainsKey($dlc)) { @($providers[$dlc] | Where-Object { $_.Key -ne $record.Key }) } else { @() })
+            foreach ($candidate in $candidates) { & $addEdge 'Incompatible' 'Native' $record $candidate ([string]$candidate.Name) $dlc $false $true $true $true $null }
+        }
+        foreach ($resolvedRule in @($record.CustomRules)) {
+            $relationship = switch ([string]$resolvedRule.Rule.relation) {
+                'Requires' { 'Requires' }
+                'LoadAfter' { 'LoadAfter' }
+                'Incompatible' { 'Incompatible' }
+                'IntegratedInto' { 'IntegratedInto' }
+                default { '' }
+            }
+            if (-not $relationship) { continue }
+            $affectsOrder = $relationship -in @('Requires', 'LoadAfter')
+            $symmetric = $relationship -eq 'Incompatible'
+            & $addEdge $relationship 'Local' $record $resolvedRule.Target ([string]$resolvedRule.TargetName) '' $affectsOrder $symmetric ([bool]$resolvedRule.VersionConditionKnown) ([bool]$resolvedRule.Applies) $resolvedRule
+        }
+    }
+
+    $occurrencesByRecord = @{}
+    foreach ($occurrence in @($occurrences | Where-Object { $_.RecordKey })) {
+        if (-not $occurrencesByRecord.ContainsKey($occurrence.RecordKey)) { $occurrencesByRecord[$occurrence.RecordKey] = [System.Collections.Generic.List[object]]::new() }
+        $occurrencesByRecord[$occurrence.RecordKey].Add($occurrence)
+    }
+    $getOccurrenceRank = {
+        param($Occurrence)
+        $stageRank = switch ([string]$Occurrence.StageKind) {
+            'BaseGame' { -1 }
+            'Creation' { 0 }
+            'WorkingQueue' { [int]$Occurrence.Stage }
+            default { [int]::MaxValue }
+        }
+        return [pscustomobject]@{ Stage = $stageRank; Order = [int]$Occurrence.Order; Id = [string]$Occurrence.Id }
+    }
+    $placeholderNodes = [System.Collections.Generic.List[object]]::new()
+    $placeholderKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $occurrenceEdges = [System.Collections.Generic.List[object]]::new()
+    $occurrenceEdgeKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($edge in $edges) {
+        $subjectOccurrences = @(if ($occurrencesByRecord.ContainsKey($edge.SubjectKey)) { @($occurrencesByRecord[$edge.SubjectKey]) } else { @() })
+        $targetOccurrences = @(if ($edge.TargetKey -and $occurrencesByRecord.ContainsKey($edge.TargetKey)) { @($occurrencesByRecord[$edge.TargetKey]) } else { @() })
+        $edge | Add-Member -NotePropertyName SubjectOccurrenceIds -NotePropertyValue @($subjectOccurrences.Id) -Force
+        $edge | Add-Member -NotePropertyName TargetOccurrenceIds -NotePropertyValue @($targetOccurrences.Id) -Force
+        foreach ($subjectOccurrence in $subjectOccurrences) {
+            $targetOccurrence = $null
+            $targetNodeId = ''
+            if ($edge.MissingTarget) {
+                $targetNodeId = "missing|$($edge.Id)|$($subjectOccurrence.StageId)"
+                if ($placeholderKeys.Add($targetNodeId)) {
+                    $placeholderNodes.Add([pscustomobject]@{
+                        Id = $targetNodeId; RecordKey = ''; StageId = [string]$subjectOccurrence.StageId; Stage = [int]$subjectOccurrence.Stage
+                        StageKind = 'Missing'; Order = [int]$subjectOccurrence.Order; Name = [string]$edge.TargetName
+                        Relationship = [string]$edge.Relationship; AffectedRecordKey = [string]$edge.SubjectKey; Record = $null
+                    })
+                }
+            } elseif ($targetOccurrences.Count) {
+                $sameContext = @()
+                if ($edge.Relationship -in @('Incompatible', 'IntegratedInto')) {
+                    $sameContext = if ($subjectOccurrence.StageKind -eq 'Creation') {
+                        @($targetOccurrences | Where-Object { $_.StageKind -eq 'Creation' })
+                    } elseif ($subjectOccurrence.StageKind -eq 'WorkingQueue') {
+                        @($targetOccurrences | Where-Object { $_.StageKind -eq 'WorkingQueue' })
+                    } else {
+                        @($targetOccurrences | Where-Object { $_.StageKind -eq $subjectOccurrence.StageKind })
+                    }
+                    if (-not $sameContext.Count) { continue }
+                } else {
+                    $subjectRank = & $getOccurrenceRank $subjectOccurrence
+                    $sameContext = @($targetOccurrences | Where-Object {
+                        $targetRank = & $getOccurrenceRank $_
+                        $targetRank.Stage -lt $subjectRank.Stage -or ($targetRank.Stage -eq $subjectRank.Stage -and $targetRank.Order -le $subjectRank.Order)
+                    })
+                    if (-not $sameContext.Count) { $sameContext = @($targetOccurrences) }
+                }
+                $targetOccurrence = @($sameContext | Sort-Object `
+                    @{ Expression = { (& $getOccurrenceRank $_).Stage } }, `
+                    @{ Expression = { (& $getOccurrenceRank $_).Order } }, `
+                    @{ Expression = { (& $getOccurrenceRank $_).Id } } | Select-Object -First 1)[0]
+                $targetNodeId = [string]$targetOccurrence.Id
+            }
+            if (-not $targetNodeId) { continue }
+            $beforeOccurrenceId = if ($edge.Relationship -eq 'IntegratedInto') { [string]$subjectOccurrence.Id } else { $targetNodeId }
+            $afterOccurrenceId = if ($edge.Relationship -eq 'IntegratedInto') { $targetNodeId } else { [string]$subjectOccurrence.Id }
+            $occurrenceEdgeId = "$($edge.Id)|$beforeOccurrenceId|$afterOccurrenceId"
+            if (-not $occurrenceEdgeKeys.Add($occurrenceEdgeId)) { continue }
+            $occurrenceEdges.Add([pscustomobject]@{
+                Id = $occurrenceEdgeId
+                RelationshipId = [string]$edge.Id
+                Relationship = [string]$edge.Relationship
+                SourceKind = [string]$edge.SourceKind
+                BeforeOccurrenceId = $beforeOccurrenceId
+                AfterOccurrenceId = $afterOccurrenceId
+                SubjectOccurrenceId = [string]$subjectOccurrence.Id
+                TargetOccurrenceId = $targetNodeId
+                MissingTarget = [bool]$edge.MissingTarget
+                AffectsOrder = [bool]$edge.AffectsOrder
+                Symmetric = [bool]$edge.Symmetric
+                VersionConditionKnown = [bool]$edge.VersionConditionKnown
+                Applies = [bool]$edge.Applies
+                RelationshipEdge = $edge
+            })
+        }
+    }
+
+    $prerequisites = @{}
+    $dependents = @{}
+    foreach ($record in $scopeRecords) {
+        $prerequisites[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $dependents[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    }
+    foreach ($edge in $edges) {
+        if (-not $edge.AffectsOrder -or -not $edge.Applies -or -not $edge.VersionConditionKnown -or $edge.MissingTarget) { continue }
+        Add-AutoSortEdge $prerequisites $dependents $edge.BeforeKey $edge.AfterKey
+    }
+
+    $issues = [System.Collections.Generic.List[object]]::new()
+    foreach ($edge in $edges) {
+        if ($edge.Relationship -eq 'Requires' -and $edge.MissingTarget -and $edge.Applies) {
+            $issues.Add([pscustomobject]@{ Kind = 'MissingTarget'; RecordKey = $edge.SubjectKey; Edge = $edge; Message = "Required mod is missing: $($edge.TargetName)" })
+        }
+        if ($edge.SourceKind -eq 'Local' -and -not $edge.VersionConditionKnown) {
+            $issues.Add([pscustomobject]@{ Kind = 'UnknownVersion'; RecordKey = $edge.SubjectKey; Edge = $edge; Message = "Local rule version is unknown: $($edge.TargetName)" })
+        }
+    }
+
+    return [pscustomobject]@{
+        RecordNodes = $recordNodes
+        ScopeNodes = $scopeNodes
+        ScopeRecords = @($scopeRecords)
+        Stages = @($stages)
+        Occurrences = @($occurrences)
+        OccurrencesByRecord = $occurrencesByRecord
+        PlaceholderNodes = @($placeholderNodes)
+        Providers = $providers
+        Edges = @($edges)
+        OccurrenceEdges = @($occurrenceEdges)
+        EdgesBySubject = $edgesBySubject
+        Prerequisites = $prerequisites
+        Dependents = $dependents
+        Issues = @($issues)
+    }
+}
+
+function Get-AutoSortPlan {
+    param($State, [object[]]$Records)
+
+    $graph = Get-DependencyGraphModel -State $State -Records $Records
+    $nodes = $graph.ScopeNodes
+    $prerequisites = @{}
+    $dependents = @{}
+    $review = @{}
+    foreach ($record in $Records) {
+        $prerequisites[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $dependents[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    }
+
+    foreach ($record in $Records) {
+        $recordEdges = @(if ($graph.EdgesBySubject.ContainsKey($record.Key)) { @($graph.EdgesBySubject[$record.Key]) } else { @() })
+        foreach ($requiredGroup in @($recordEdges | Where-Object { $_.SourceKind -eq 'Native' -and $_.Relationship -eq 'Requires' } | Group-Object Dlc)) {
+            $dlc = [string]$requiredGroup.Name
+            $candidates = @($requiredGroup.Group | Where-Object { -not $_.MissingTarget } | ForEach-Object { $_.TargetRecord })
             if (-not $candidates.Count) { Add-AutoSortReviewReason $review $record.Key "Required mod is missing: $dlc"; continue }
             $earlierOutside = @($candidates | Where-Object { -not $nodes.ContainsKey($_.Key) -and ($_.InCreation -or ($null -ne $_.Target -and (Test-WorkingRecordComesFirst -Earlier $_ -Later $record))) })
             if ($earlierOutside.Count) { continue }
@@ -875,8 +1301,8 @@ function Get-AutoSortPlan {
             else { Add-AutoSortReviewReason $review $record.Key "Required mod is unassigned: $($candidates[0].Name)" }
         }
 
-        foreach ($dlc in $record.Facts.Conditional) {
-            $candidates = @(if ($providers.ContainsKey($dlc)) { @($providers[$dlc] | Where-Object { $_.Key -ne $record.Key -and ($null -ne $_.Target -or $_.InCreation) }) } else { @() })
+        foreach ($conditionalGroup in @($recordEdges | Where-Object { $_.SourceKind -eq 'Native' -and $_.Relationship -eq 'Compatibility' } | Group-Object Dlc)) {
+            $candidates = @($conditionalGroup.Group | ForEach-Object { $_.TargetRecord } | Where-Object { $null -ne $_ -and ($null -ne $_.Target -or $_.InCreation) })
             foreach ($candidate in $candidates) {
                 if ($nodes.ContainsKey($candidate.Key)) {
                     Add-AutoSortEdge $prerequisites $dependents $candidate.Key $record.Key
@@ -886,17 +1312,16 @@ function Get-AutoSortPlan {
             }
         }
 
-        foreach ($resolvedRule in @($record.CustomRules)) {
-            if ($resolvedRule.Rule.relation -notin @('Requires', 'LoadAfter')) { continue }
-            if (-not $resolvedRule.VersionConditionKnown) {
-                Add-AutoSortReviewReason $review $record.Key "Local rule version is unknown: $($resolvedRule.TargetName)"
+        foreach ($edge in @($recordEdges | Where-Object { $_.SourceKind -eq 'Local' -and $_.Relationship -in @('Requires', 'LoadAfter') })) {
+            if (-not $edge.VersionConditionKnown) {
+                Add-AutoSortReviewReason $review $record.Key "Local rule version is unknown: $($edge.TargetName)"
                 continue
             }
-            if (-not $resolvedRule.Applies) { continue }
-            $candidate = $resolvedRule.Target
-            $isRequired = $resolvedRule.Rule.relation -eq 'Requires'
+            if (-not $edge.Applies) { continue }
+            $candidate = $edge.TargetRecord
+            $isRequired = $edge.Relationship -eq 'Requires'
             if ($null -eq $candidate) {
-                if ($isRequired) { Add-AutoSortReviewReason $review $record.Key "Local dependency is missing: $($resolvedRule.TargetName)" }
+                if ($isRequired) { Add-AutoSortReviewReason $review $record.Key "Local dependency is missing: $($edge.TargetName)" }
                 continue
             }
             if ($nodes.ContainsKey($candidate.Key)) {
@@ -970,51 +1395,26 @@ function Set-AutoSortReview {
 function Update-StateStatus {
     param($State)
 
-    $providers = @{}
-    foreach ($record in $State.Records.Values) {
-        foreach ($dlc in $record.Facts.Provided) {
-            if (-not $providers.ContainsKey($dlc)) { $providers[$dlc] = [System.Collections.Generic.List[object]]::new() }
-            $providers[$dlc].Add($record)
-        }
-    }
-    $State.Providers = $providers
-
     foreach ($record in $State.Records.Values) {
         $record | Add-Member -NotePropertyName CustomRules -NotePropertyValue @() -Force
         $record | Add-Member -NotePropertyName ReferencedByCustomRules -NotePropertyValue @() -Force
     }
     $resolvedCustomRules = @(Get-ResolvedCustomRules -State $State)
-    $activeCustomRules = @($resolvedCustomRules | Where-Object { $_.Applies })
     foreach ($resolvedRule in $resolvedCustomRules) {
         $resolvedRule.Subject.CustomRules = @($resolvedRule.Subject.CustomRules) + @($resolvedRule)
         if ($null -ne $resolvedRule.Target -and $resolvedRule.Target.Key -ne $resolvedRule.Subject.Key) {
             $resolvedRule.Target.ReferencedByCustomRules = @($resolvedRule.Target.ReferencedByCustomRules) + @($resolvedRule)
         }
     }
+    $graph = Get-DependencyGraphModel -State $State
+    $providers = $graph.Providers
+    $State.Providers = $providers
+    $State | Add-Member -NotePropertyName DependencyModel -NotePropertyValue $graph -Force
 
     $incompatiblePartners = @{}
-    foreach ($record in $State.Records.Values) {
-        foreach ($dlc in $record.Facts.Incompatible) {
-            if (-not $providers.ContainsKey($dlc)) { continue }
-            foreach ($candidate in $providers[$dlc]) {
-                if ($candidate.Key -eq $record.Key) { continue }
-                $togetherInWorkingQueues = $null -ne $record.Target -and $null -ne $candidate.Target
-                $togetherInCreation = $record.InCreation -and $candidate.InCreation
-                if (-not ($togetherInWorkingQueues -or $togetherInCreation)) { continue }
-                if (-not $incompatiblePartners.ContainsKey($record.Key)) {
-                    $incompatiblePartners[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                }
-                if (-not $incompatiblePartners.ContainsKey($candidate.Key)) {
-                    $incompatiblePartners[$candidate.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                }
-                [void]$incompatiblePartners[$record.Key].Add([string]$candidate.Name)
-                [void]$incompatiblePartners[$candidate.Key].Add([string]$record.Name)
-            }
-        }
-    }
-    foreach ($resolvedRule in @($activeCustomRules | Where-Object { $_.Rule.relation -eq 'Incompatible' -and $null -ne $_.Target })) {
-        $record = $resolvedRule.Subject
-        $candidate = $resolvedRule.Target
+    foreach ($edge in @($graph.Edges | Where-Object { $_.Relationship -eq 'Incompatible' -and $_.Applies -and $_.VersionConditionKnown -and -not $_.MissingTarget })) {
+        $record = $edge.SubjectRecord
+        $candidate = $edge.TargetRecord
         if ($candidate.Key -eq $record.Key) { continue }
         $togetherInWorkingQueues = $null -ne $record.Target -and $null -ne $candidate.Target
         $togetherInCreation = $record.InCreation -and $candidate.InCreation
@@ -1025,15 +1425,20 @@ function Update-StateStatus {
         if (-not $incompatiblePartners.ContainsKey($candidate.Key)) {
             $incompatiblePartners[$candidate.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         }
-        $localMarker = if ($resolvedRule.VersionConditionText) { "[Local, $($resolvedRule.VersionConditionText)]" } else { '[Local]' }
-        [void]$incompatiblePartners[$record.Key].Add("$($candidate.Name) $localMarker")
-        [void]$incompatiblePartners[$candidate.Key].Add("$($record.Name) $localMarker")
+        if ($edge.SourceKind -eq 'Local') {
+            $localMarker = if ($edge.RuleResolution.VersionConditionText) { "[Local, $($edge.RuleResolution.VersionConditionText)]" } else { '[Local]' }
+            [void]$incompatiblePartners[$record.Key].Add("$($candidate.Name) $localMarker")
+            [void]$incompatiblePartners[$candidate.Key].Add("$($record.Name) $localMarker")
+        } else {
+            [void]$incompatiblePartners[$record.Key].Add([string]$candidate.Name)
+            [void]$incompatiblePartners[$candidate.Key].Add([string]$record.Name)
+        }
     }
 
     $integratedTargets = @{}
-    foreach ($resolvedRule in @($activeCustomRules | Where-Object { $_.Rule.relation -eq 'IntegratedInto' -and $null -ne $_.Target })) {
-        $record = $resolvedRule.Subject
-        $candidate = $resolvedRule.Target
+    foreach ($edge in @($graph.Edges | Where-Object { $_.Relationship -eq 'IntegratedInto' -and $_.Applies -and $_.VersionConditionKnown -and -not $_.MissingTarget })) {
+        $record = $edge.SubjectRecord
+        $candidate = $edge.TargetRecord
         if ($candidate.Key -eq $record.Key) { continue }
         $togetherInWorkingQueues = $null -ne $record.Target -and $null -ne $candidate.Target
         $togetherInCreation = $record.InCreation -and $candidate.InCreation
@@ -1041,7 +1446,7 @@ function Update-StateStatus {
         if (-not $integratedTargets.ContainsKey($record.Key)) {
             $integratedTargets[$record.Key] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         }
-        $localMarker = if ($resolvedRule.VersionConditionText) { "[Local, $($resolvedRule.VersionConditionText)]" } else { '[Local]' }
+        $localMarker = if ($edge.RuleResolution.VersionConditionText) { "[Local, $($edge.RuleResolution.VersionConditionText)]" } else { '[Local]' }
         [void]$integratedTargets[$record.Key].Add("$($candidate.Name) $localMarker")
     }
 
@@ -1062,15 +1467,17 @@ function Update-StateStatus {
         if ($integratedTargets.ContainsKey($record.Key)) {
             foreach ($targetName in @($integratedTargets[$record.Key] | Sort-Object)) { $problems.Add("Already integrated into: $targetName") }
         }
+        $recordEdges = @(if ($graph.EdgesBySubject.ContainsKey($record.Key)) { @($graph.EdgesBySubject[$record.Key]) } else { @() })
         if ($null -ne $record.Target -or $record.InCreation) {
-            foreach ($resolvedRule in @($record.CustomRules | Where-Object { -not $_.VersionConditionKnown })) {
-                $problems.Add("Local rule version could not be checked: $($resolvedRule.TargetName) ($($resolvedRule.VersionConditionText))")
+            foreach ($edge in @($recordEdges | Where-Object { $_.SourceKind -eq 'Local' -and -not $_.VersionConditionKnown })) {
+                $problems.Add("Local rule version could not be checked: $($edge.TargetName) ($($edge.RuleResolution.VersionConditionText))")
             }
         }
 
         if ($null -ne $record.Target) {
-            foreach ($dlc in $record.Facts.Required) {
-                $candidates = if ($providers.ContainsKey($dlc)) { @($providers[$dlc] | Where-Object { $_.Key -ne $record.Key }) } else { @() }
+            foreach ($requiredGroup in @($recordEdges | Where-Object { $_.SourceKind -eq 'Native' -and $_.Relationship -eq 'Requires' } | Group-Object Dlc)) {
+                $dlc = [string]$requiredGroup.Name
+                $candidates = @($requiredGroup.Group | Where-Object { -not $_.MissingTarget } | ForEach-Object { $_.TargetRecord })
                 if ($candidates.Count -eq 0) { $problems.Add("Dependency is missing: $dlc"); continue }
                 $validProvider = @($candidates | Where-Object {
                     $null -ne $_.Target -and (
@@ -1089,8 +1496,8 @@ function Update-StateStatus {
                 }
             }
 
-            foreach ($dlc in $record.Facts.Conditional) {
-                $patchTargets = if ($providers.ContainsKey($dlc)) { @($providers[$dlc] | Where-Object { $_.Key -ne $record.Key -and $null -ne $_.Target }) } else { @() }
+            foreach ($conditionalGroup in @($recordEdges | Where-Object { $_.SourceKind -eq 'Native' -and $_.Relationship -eq 'Compatibility' } | Group-Object Dlc)) {
+                $patchTargets = @($conditionalGroup.Group | ForEach-Object { $_.TargetRecord } | Where-Object { $null -ne $_ -and $null -ne $_.Target })
                 if ($patchTargets.Count -eq 0) { continue }
                 $validTarget = @($patchTargets | Where-Object {
                     [int]$_.Target -lt [int]$record.Target -or
@@ -1105,10 +1512,10 @@ function Update-StateStatus {
                 }
             }
         }
-        foreach ($resolvedRule in @($record.CustomRules | Where-Object { $_.Applies -and $_.Rule.relation -in @('Requires', 'LoadAfter') })) {
-            $target = $resolvedRule.Target
-            $targetName = [string]$resolvedRule.TargetName
-            $isRequired = $resolvedRule.Rule.relation -eq 'Requires'
+        foreach ($edge in @($recordEdges | Where-Object { $_.SourceKind -eq 'Local' -and $_.Applies -and $_.VersionConditionKnown -and $_.Relationship -in @('Requires', 'LoadAfter') })) {
+            $target = $edge.TargetRecord
+            $targetName = [string]$edge.TargetName
+            $isRequired = $edge.Relationship -eq 'Requires'
             if ($null -ne $record.Target) {
                 if ($isRequired -and $null -eq $target) {
                     $problems.Add("Local dependency is missing: $targetName")
@@ -1174,7 +1581,7 @@ function Save-GameState {
     param($State)
 
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $backupRoot = Join-Path $script:QueueRoot "OrganizerBackups\$stamp-$($State.Game)-$($State.SetId)"
+    $backupRoot = Join-Path $script:BackupRoot "$stamp-$($State.Game)-$($State.SetId)"
     [void](New-Item -ItemType Directory -Path $backupRoot -Force)
 
     foreach ($stage in @($State.StageNames.Keys | Sort-Object { [int]$_ })) {
@@ -1206,8 +1613,56 @@ function Save-GameState {
         $json = $queueInfo.Data | ConvertTo-Json -Depth 30
         [System.IO.File]::WriteAllText($queueInfo.Path, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
     }
+    Sync-ActiveOrganizerQueues
     $State.Dirty = $false
     return $backupRoot
+}
+
+function Get-QueueModsAfterOrganizerDeletion {
+    param($QueueData, [string]$Game, [System.Collections.Generic.HashSet[string]]$SelectedKeys)
+
+    $remaining = [System.Collections.Generic.List[object]]::new()
+    $removedCount = 0
+    foreach ($entry in @($QueueData.mods)) {
+        $relativePath = if ($null -eq $entry) { '' } else { ([string]$entry.moddescpath).Trim() }
+        $key = if ([string]::IsNullOrWhiteSpace($relativePath)) { '' } else { "$Game|$($relativePath.ToLowerInvariant())" }
+        if ($key -and $SelectedKeys.Contains($key)) {
+            $removedCount++
+        } else {
+            $remaining.Add($entry)
+        }
+    }
+    return [pscustomobject]@{ RemovedCount = $removedCount; Remaining = @($remaining) }
+}
+
+function Test-OrganizerQueueStorageIsolation {
+    $queueRootPath = [System.IO.Path]::GetFullPath($script:QueueRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $storeRootPath = [System.IO.Path]::GetFullPath($script:OrganizerQueueStoreRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $backupRootPath = [System.IO.Path]::GetFullPath($script:BackupRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $modsRootPath = [System.IO.Path]::GetFullPath($ModsRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $deletedModsRootPath = [System.IO.Path]::GetFullPath($script:DeletedModsRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    if ($storeRootPath.StartsWith($queueRootPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Organizer queue storage is still inside the ME3Tweaks queue tree.' }
+    if ($backupRootPath.StartsWith($queueRootPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Organizer backup storage is still inside the ME3Tweaks queue tree.' }
+    if ($deletedModsRootPath -eq $modsRootPath -or $deletedModsRootPath.StartsWith($modsRootPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Deleted-mod storage is still inside the ME3Tweaks mods tree.' }
+    if (Test-Path -LiteralPath (Join-Path $script:QueueRoot 'OrganizerQueueSets')) { throw 'Legacy OrganizerQueueSets remained inside ME3Tweaks.' }
+    if (Test-Path -LiteralPath (Join-Path $script:QueueRoot 'OrganizerBackups')) { throw 'Legacy OrganizerBackups remained inside ME3Tweaks.' }
+    $activeSetId = Get-ActiveSetId
+    $publishedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in @(Get-ChildItem -LiteralPath $script:QueueRoot -Filter '*.biq2' -File)) {
+        try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        $identity = Get-OrganizerQueueIdentity -File $file -Data $data
+        if ($null -eq $identity) { continue }
+        if ([int]$identity.Order -gt 0 -and $identity.SetId -ne $activeSetId) { throw "Inactive Organizer queue is published in ME3Tweaks: $($file.Name)" }
+        if (-not $publishedKeys.Add($identity.Key)) { throw "Duplicate Organizer queue is published in ME3Tweaks: $($identity.Key)" }
+    }
+    foreach ($entry in @($script:QueueRegistry)) {
+        $storePath = Get-OrganizerQueueStorePath -Entry $entry
+        if (-not (Test-Path -LiteralPath $storePath -PathType Leaf)) { continue }
+        if ([int]$entry.Order -eq 0 -or $entry.SetId -eq $activeSetId) {
+            $expectedKey = "$($entry.Game)|$(if([int]$entry.Order -eq 0){'creation'}else{$entry.SetId})|$([int]$entry.Order)"
+            if (-not $publishedKeys.Contains($expectedKey)) { throw "Active Organizer queue was not published to ME3Tweaks: $($entry.FileName)" }
+        }
+    }
 }
 
 function Invoke-SelfTest {
@@ -1217,6 +1672,16 @@ function Invoke-SelfTest {
     if (-not $testAsiRecord.Memberships.Contains(1) -or [int]$testAsiRecord.VersionsByStage[1] -ne 13 -or $testAsiRecord.Status -ne 'OK') { throw 'ASI membership addition regression test failed.' }
     Set-AsiRecordQueueMembership -Record $testAsiRecord -Stage 1 -Include $false
     if ($testAsiRecord.Memberships.Contains(1) -or $testAsiRecord.Status -ne 'Unassigned') { throw 'ASI membership removal regression test failed.' }
+    $deleteKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    [void]$deleteKeys.Add('LE1|le1\deleted mod\moddesc.ini')
+    $deleteQueueData = [pscustomobject]@{ mods = @(
+        [pscustomobject]@{ moddescpath = 'LE1\Deleted Mod\moddesc.ini'; modname = 'Deleted Mod' },
+        [pscustomobject]@{ moddescpath = 'LE1\Kept Mod\moddesc.ini'; modname = 'Kept Mod' }
+    ) }
+    $deletePreview = Get-QueueModsAfterOrganizerDeletion -QueueData $deleteQueueData -Game 'LE1' -SelectedKeys $deleteKeys
+    if ($deletePreview.RemovedCount -ne 1 -or $deletePreview.Remaining.Count -ne 1 -or $deletePreview.Remaining[0].modname -ne 'Kept Mod') {
+        throw 'Organizer mod deletion queue filtering regression test failed.'
+    }
     $savedCustomRulesPath = $script:CustomRulesPath
     $savedCustomRulesForRoundTrip = @($script:CustomRules)
     $savedCustomRulesLoadError = $script:CustomRulesLoadError
@@ -1275,19 +1740,72 @@ function Invoke-SelfTest {
     }
     $provider = & $newSortTestRecord -Key 'provider' -Name 'Provider' -MountId 100 -Provided @('DLC_TEST_A') -ReferenceOrder 1
     $dependent = & $newSortTestRecord -Key 'dependent' -Name 'Dependent' -MountId 10 -Required @('DLC_TEST_A') -ReferenceOrder 0
+    $dependent.Facts.Conditional = @('DLC_TEST_A')
     $plain = & $newSortTestRecord -Key 'plain' -Name 'Plain' -MountId 20 -ReferenceOrder 2
     $missing = & $newSortTestRecord -Key 'missing' -Name 'Missing dependency' -MountId 5 -Required @('DLC_TEST_MISSING') -ReferenceOrder 3
     $localTarget = & $newSortTestRecord -Key 'local-target' -Name 'Local target' -MountId 200 -ReferenceOrder 4
     $localSubject = & $newSortTestRecord -Key 'local-subject' -Name 'Local subject' -MountId 1 -ReferenceOrder 5
     $creationProvider = & $newSortTestRecord -Key 'creation-provider' -Name 'Creation provider' -MountId 300 -Provided @('DLC_TEST_CREATION') -Target $null -InCreation $true -ReferenceOrder 0
     $creationDependent = & $newSortTestRecord -Key 'creation-dependent' -Name 'Creation dependent' -MountId 2 -Required @('DLC_TEST_CREATION') -ReferenceOrder 6
+    $dualOccurrence = & $newSortTestRecord -Key 'dual-occurrence' -Name 'Creation and working occurrence' -MountId 400 -Target 2 -InCreation $true -ReferenceOrder 7
+    $unknownVersionSubject = & $newSortTestRecord -Key 'unknown-version-subject' -Name 'Unknown version subject' -MountId 500 -Target 2 -ReferenceOrder 8
     $localSubject.CustomRules = @([pscustomobject]@{
         VersionConditionKnown = $true; Applies = $true; Rule = [pscustomobject]@{ relation = 'LoadAfter' }
         Target = $localTarget; TargetName = $localTarget.Name
+    }, [pscustomobject]@{
+        VersionConditionKnown = $true; Applies = $true; Rule = [pscustomobject]@{ relation = 'Incompatible' }
+        Target = $localTarget; TargetName = $localTarget.Name
+    }, [pscustomobject]@{
+        VersionConditionKnown = $true; Applies = $true; Rule = [pscustomobject]@{ relation = 'IntegratedInto' }
+        Target = $localTarget; TargetName = $localTarget.Name
+    })
+    $unknownVersionSubject.CustomRules = @([pscustomobject]@{
+        VersionConditionKnown = $false; Applies = $false; VersionConditionText = 'target version >= 2.0'
+        Rule = [pscustomobject]@{ relation = 'Requires' }; Target = $localTarget; TargetName = $localTarget.Name
     })
     $sortState = [pscustomobject]@{ Records = @{} }
-    foreach ($record in @($provider, $dependent, $plain, $missing, $localTarget, $localSubject, $creationProvider, $creationDependent)) { $sortState.Records[$record.Key] = $record }
+    foreach ($record in @($provider, $dependent, $plain, $missing, $localTarget, $localSubject, $creationProvider, $creationDependent, $dualOccurrence, $unknownVersionSubject)) { $sortState.Records[$record.Key] = $record }
     $sortScope = @($provider, $dependent, $plain, $missing, $localTarget, $localSubject, $creationDependent)
+    $sharedModel = Get-DependencyGraphModel -State $sortState -Records $sortScope
+    if (-not @($sharedModel.Edges | Where-Object { $_.SourceKind -eq 'Native' -and $_.Relationship -eq 'Requires' -and $_.TargetKey -eq 'provider' -and $_.SubjectKey -eq 'dependent' }).Count) {
+        throw 'Shared model native dependency edge regression test failed.'
+    }
+    if (-not @($sharedModel.Edges | Where-Object { $_.SourceKind -eq 'Native' -and $_.Relationship -eq 'Compatibility' -and $_.TargetKey -eq 'provider' -and $_.SubjectKey -eq 'dependent' }).Count) {
+        throw 'Shared model compatibility edge regression test failed.'
+    }
+    if (-not @($sharedModel.Edges | Where-Object { $_.SourceKind -eq 'Local' -and $_.Relationship -eq 'LoadAfter' -and $_.TargetKey -eq 'local-target' -and $_.SubjectKey -eq 'local-subject' }).Count -or
+        -not @($sharedModel.Edges | Where-Object { $_.SourceKind -eq 'Local' -and $_.Relationship -eq 'Incompatible' -and $_.Symmetric }).Count -or
+        -not @($sharedModel.Edges | Where-Object { $_.SourceKind -eq 'Local' -and $_.Relationship -eq 'IntegratedInto' -and $_.BeforeKey -eq 'local-subject' -and $_.AfterKey -eq 'local-target' }).Count) {
+        throw 'Shared model local relationship edge regression test failed.'
+    }
+    if (-not @($sharedModel.Issues | Where-Object { $_.Kind -eq 'MissingTarget' -and $_.RecordKey -eq 'missing' }).Count -or
+        -not @($sharedModel.Issues | Where-Object { $_.Kind -eq 'UnknownVersion' -and $_.RecordKey -eq 'unknown-version-subject' }).Count) {
+        throw 'Shared model unresolved relationship regression test failed.'
+    }
+    if (@($sharedModel.Occurrences | Where-Object { $_.RecordKey -eq 'dual-occurrence' }).Count -ne 2 -or
+        -not @($sharedModel.Occurrences | Where-Object { $_.RecordKey -eq 'dual-occurrence' -and $_.StageKind -eq 'Creation' }).Count -or
+        -not @($sharedModel.Occurrences | Where-Object { $_.RecordKey -eq 'dual-occurrence' -and $_.StageKind -eq 'WorkingQueue' }).Count) {
+        throw 'Shared model occurrence separation regression test failed.'
+    }
+    if (-not @($sharedModel.OccurrenceEdges | Where-Object {
+        $_.Relationship -eq 'Requires' -and $_.RelationshipEdge.SubjectKey -eq 'creation-dependent' -and
+        $_.TargetOccurrenceId -eq 'creation-provider|creation'
+    }).Count) {
+        throw 'Shared model earliest Creation occurrence regression test failed.'
+    }
+    if (-not @($sharedModel.PlaceholderNodes | Where-Object { $_.AffectedRecordKey -eq 'missing' -and $_.Relationship -eq 'Requires' }).Count) {
+        throw 'Shared model missing placeholder regression test failed.'
+    }
+    $validEndpointIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($node in @($sharedModel.Occurrences) + @($sharedModel.PlaceholderNodes)) { [void]$validEndpointIds.Add([string]$node.Id) }
+    foreach ($edge in $sharedModel.OccurrenceEdges) {
+        if (-not $validEndpointIds.Contains([string]$edge.BeforeOccurrenceId) -or -not $validEndpointIds.Contains([string]$edge.AfterOccurrenceId)) {
+            throw 'Shared model occurrence edge endpoint regression test failed.'
+        }
+    }
+    if (-not $sharedModel.Prerequisites['dependent'].Contains('provider') -or -not $sharedModel.Dependents['provider'].Contains('dependent')) {
+        throw 'Shared model adjacency regression test failed.'
+    }
     $sortPlan = Get-AutoSortPlan -State $sortState -Records $sortScope
     $sortKeys = @($sortPlan.Ordered.Key)
     if ([Array]::IndexOf($sortKeys, 'provider') -ge [Array]::IndexOf($sortKeys, 'dependent')) { throw 'Auto-sort native dependency regression test failed.' }
@@ -1339,7 +1857,9 @@ function Invoke-SelfTest {
                 $laterRecord.Status -notlike '*Incompatible with:*' -or -not $laterRecord.Status.Contains('[Local]')) {
                 throw 'Local incompatibility rule regression test failed.'
             }
-            if ($earlierRecord.Status -notlike '*Local dependency is installed later:*' -or $earlierRecord.Status -notlike '*Local load-after target is installed later:*') {
+            $dependencyOrderingWarning = $earlierRecord.Status -like '*Local dependency is installed later:*' -or $earlierRecord.Status -like '*Local dependency is ordered later:*'
+            $loadAfterOrderingWarning = $earlierRecord.Status -like '*Local load-after target is installed later:*' -or $earlierRecord.Status -like '*Local load-after target is ordered later:*'
+            if (-not $dependencyOrderingWarning -or -not $loadAfterOrderingWarning) {
                 throw 'Local dependency/load-after ordering regression test failed.'
             }
             if ($earlierRecord.Status -notlike '*Already integrated into:*') { throw 'Local integrated-mod rule regression test failed.' }
@@ -1354,6 +1874,20 @@ function Invoke-SelfTest {
         $assignedForAutoSort = @($state.Records.Values | Where-Object { $null -ne $_.Target })
         $autoSortPlan = Get-AutoSortPlan -State $state -Records $assignedForAutoSort
         if ($autoSortPlan.Ordered.Count -ne $assignedForAutoSort.Count) { throw "Auto-sort did not return every assigned $game mod." }
+        $gameGraph = $state.DependencyModel
+        if ($null -eq $gameGraph -or $gameGraph.RecordNodes.Count -ne $state.Records.Count) { throw "Shared dependency model record count mismatch for $game." }
+        foreach ($record in $state.Records.Values) {
+            if (-not $gameGraph.OccurrencesByRecord.ContainsKey($record.Key) -or $gameGraph.OccurrencesByRecord[$record.Key].Count -lt 1) {
+                throw "Shared dependency model has no occurrence for $game mod $($record.Name)."
+            }
+        }
+        $gameEndpointIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($node in @($gameGraph.Occurrences) + @($gameGraph.PlaceholderNodes)) { [void]$gameEndpointIds.Add([string]$node.Id) }
+        foreach ($edge in $gameGraph.OccurrenceEdges) {
+            if (-not $gameEndpointIds.Contains([string]$edge.BeforeOccurrenceId) -or -not $gameEndpointIds.Contains([string]$edge.AfterOccurrenceId)) {
+                throw "Shared dependency model has an invalid occurrence edge for $game."
+            }
+        }
         foreach ($stage in $state.StageNames.Keys) {
             $originalAsi = @($state.Queues[$stage].Data.asimods | Where-Object { $null -ne $_.updategroup } | ForEach-Object { "$([int]$_.updategroup):$([int]$_.version)" } | Sort-Object)
             $rebuiltAsi = @($state.AsiRecords.Values | Where-Object { $_.Memberships.Contains([int]$stage) } | ForEach-Object {
@@ -1389,11 +1923,17 @@ function Invoke-SelfTest {
     Write-Output "All view ASI plugins: $($allState.AsiRecords.Count)"
     Write-Output 'ASI membership add/remove: OK'
     Write-Output 'ASI queue round-trip: OK'
+    Write-Output 'Organizer mod deletion queue filtering: OK'
     Write-Output 'Local rule resolution/status: OK'
     Write-Output 'Local rule JSON round-trip: OK'
     Write-Output 'Version conditions/integrated rules: OK'
+    Write-Output 'Shared dependency graph model: OK'
     Write-Output 'Dependency-aware auto-sort graph: OK'
+    Test-OrganizerQueueStorageIsolation
+    Write-Output 'Organizer queue storage isolation: OK'
 }
+
+if ($script:QueueRoot) { Initialize-OrganizerQueueStorage }
 
 if ($SelfTest) {
     if (-not $script:QueueRoot) { throw 'SelfTest requires a valid saved ModManagerRoot or the -ModsRoot parameter.' }
@@ -1404,8 +1944,9 @@ if ($SelfTest) {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName Microsoft.VisualBasic
-Add-Type -TypeDefinition @'
+Add-Type -ReferencedAssemblies @('System.Windows.Forms', 'System.Drawing') -TypeDefinition @'
 using System.Runtime.InteropServices;
+using System.Windows.Forms;
 
 public static class OrganizerTaskbarIdentity
 {
@@ -1415,6 +1956,18 @@ public static class OrganizerTaskbarIdentity
     public static void Apply()
     {
         SetCurrentProcessExplicitAppUserModelID("ME3Tweaks.BatchQueueOrganizer");
+    }
+}
+
+public sealed class BufferedGraphPanel : Panel
+{
+    public BufferedGraphPanel()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.UserPaint |
+                 ControlStyles.OptimizedDoubleBuffer |
+                 ControlStyles.ResizeRedraw, true);
+        UpdateStyles();
     }
 }
 '@
@@ -1446,6 +1999,7 @@ if (-not $script:QueueRoot) {
     [System.IO.File]::WriteAllText($script:SettingsPath, (($script:WindowSettings | ConvertTo-Json -Depth 10) + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
     $picker.Dispose()
 }
+Initialize-OrganizerQueueStorage
 
 $form = [System.Windows.Forms.Form]@{
     Text = "ME3Tweaks Batch Queue Organizer v$($script:AppVersion)"
@@ -1454,8 +2008,15 @@ $form = [System.Windows.Forms.Form]@{
     StartPosition = 'CenterScreen'
     MinimumSize = [System.Drawing.Size]::new(1050, 650)
 }
+if ($UiSmokeTest) { $form.Opacity = 0; $form.ShowInTaskbar = $false }
 $iconPath = Join-Path $PSScriptRoot 'ME3TweaksBatchQueueOrganizer.ico'
 if (Test-Path -LiteralPath $iconPath) { $form.Icon = [System.Drawing.Icon]::new($iconPath) }
+$script:GraphZoom = if ($script:WindowSettings -and [double]$script:WindowSettings.GraphZoom -ge 0.5 -and [double]$script:WindowSettings.GraphZoom -le 2.5) { [double]$script:WindowSettings.GraphZoom } else { 1.0 }
+$script:GraphSelectedOccurrenceId = ''
+$script:SelectedGraphRecord = $null
+$script:GraphLayout = $null
+$script:UpdatingViewMode = $false
+$script:PreferredViewMode = if ($script:WindowSettings -and [string]$script:WindowSettings.ViewMode -eq 'Dependency Graph') { 'Dependency Graph' } else { 'List' }
 
 $top = [System.Windows.Forms.Panel]@{ Dock = 'Top'; Height = 82; Padding = [System.Windows.Forms.Padding]::new(8) }
 $gameLabel = [System.Windows.Forms.Label]@{ Text = 'Game:'; AutoSize = $true; Left = 10; Top = 15 }
@@ -1467,12 +2028,14 @@ $filterBox = [System.Windows.Forms.ComboBox]@{ Left = 445; Top = 10; Width = 105
 [void]$filterBox.Items.AddRange(@('All mods', 'Unassigned', 'Problems', 'Duplicates', 'Only OK'))
 $queueFilterBox = [System.Windows.Forms.ComboBox]@{ Left = 560; Top = 10; Width = 160; DropDownStyle = 'DropDownList' }
 [void]$queueFilterBox.Items.Add('All assigned queues')
-$sortBox = [System.Windows.Forms.ComboBox]@{ Left = 730; Top = 10; Width = 120; DropDownStyle = 'DropDownList' }
+$sortBox = [System.Windows.Forms.ComboBox]@{ Left = 730; Top = 10; Width = 110; DropDownStyle = 'DropDownList' }
 [void]$sortBox.Items.AddRange(@('Sort: Name', 'Sort: Order', 'Sort: Mount ID'))
-$reloadButton = [System.Windows.Forms.Button]@{ Text = 'Reload'; Left = 860; Top = 8; Width = 70 }
-$saveButton = [System.Windows.Forms.Button]@{ Text = 'Save queues'; Left = 940; Top = 8; Width = 100 }
-$creationEditToggle = [System.Windows.Forms.CheckBox]@{ Text = 'Edit Creation List'; Left = 1050; Top = 12; Width = 145 }
-$summaryLabel = [System.Windows.Forms.Label]@{ Left = 1205; Top = 14; Width = 190; AutoEllipsis = $true }
+$viewBox = [System.Windows.Forms.ComboBox]@{ Left = 850; Top = 10; Width = 125; DropDownStyle = 'DropDownList' }
+[void]$viewBox.Items.AddRange(@('List', 'Dependency Graph'))
+$reloadButton = [System.Windows.Forms.Button]@{ Text = 'Reload'; Left = 985; Top = 8; Width = 65 }
+$saveButton = [System.Windows.Forms.Button]@{ Text = 'Save queues'; Left = 1060; Top = 8; Width = 90 }
+$creationEditToggle = [System.Windows.Forms.CheckBox]@{ Text = 'Edit Creation List'; Left = 1160; Top = 12; Width = 135 }
+$summaryLabel = [System.Windows.Forms.Label]@{ Left = 1300; Top = 14; Width = 180; AutoEllipsis = $true }
 $setLabel = [System.Windows.Forms.Label]@{ Text = 'Set:'; AutoSize = $true; Left = 10; Top = 54 }
 $setBox = [System.Windows.Forms.ComboBox]@{ Left = 55; Top = 49; Width = 220; DropDownStyle = 'DropDownList' }
 $newSetButton = [System.Windows.Forms.Button]@{ Text = 'New set'; Left = 285; Top = 47; Width = 80 }
@@ -1482,7 +2045,30 @@ $activeSetTitle = [System.Windows.Forms.Label]@{ Text = 'Active in ME3Tweaks:'; 
 $activeSetBox = [System.Windows.Forms.ComboBox]@{ Left = 710; Top = 49; Width = 220; DropDownStyle = 'DropDownList' }
 $asiEditToggle = [System.Windows.Forms.CheckBox]@{ Text = 'Edit ASI Plugins'; Left = 945; Top = 51; Width = 140 }
 $activeSetLabel = [System.Windows.Forms.Label]@{ Text = 'Changing the viewed set does not change ME3Tweaks.'; Left = 1090; Top = 53; Width = 295; AutoEllipsis = $true }
-$top.Controls.AddRange(@($gameLabel, $gameBox, $searchLabel, $searchBox, $filterBox, $queueFilterBox, $sortBox, $reloadButton, $saveButton, $creationEditToggle, $summaryLabel, $setLabel, $setBox, $newSetButton, $renameSetButton, $deleteSetButton, $activeSetTitle, $activeSetBox, $asiEditToggle, $activeSetLabel))
+$top.Controls.AddRange(@($gameLabel, $gameBox, $searchLabel, $searchBox, $filterBox, $queueFilterBox, $sortBox, $viewBox, $reloadButton, $saveButton, $creationEditToggle, $summaryLabel, $setLabel, $setBox, $newSetButton, $renameSetButton, $deleteSetButton, $activeSetTitle, $activeSetBox, $asiEditToggle, $activeSetLabel))
+$summaryToolTip = [System.Windows.Forms.ToolTip]::new()
+
+function Set-SummaryText {
+    param([string]$Text)
+    $summaryLabel.Text = $Text
+    $summaryToolTip.SetToolTip($summaryLabel, $Text)
+}
+
+function Update-TopBarSummaryLayout {
+    $availableWidth = [Math]::Max(0, $top.ClientSize.Width)
+    if ($availableWidth -ge 1500) {
+        if ($top.Height -ne 82) { $top.Height = 82 }
+        $summaryLabel.Left = 1300
+        $summaryLabel.Top = 14
+        $summaryLabel.Width = [Math]::Max(180, $availableWidth - 1310)
+    } else {
+        if ($top.Height -ne 106) { $top.Height = 106 }
+        $summaryLabel.Left = 10
+        $summaryLabel.Top = 84
+        $summaryLabel.Width = [Math]::Max(180, $availableWidth - 20)
+    }
+}
+$top.add_Resize({ Update-TopBarSummaryLayout })
 
 $split = [System.Windows.Forms.SplitContainer]@{
     Dock = 'Fill'
@@ -1502,6 +2088,33 @@ $list = [System.Windows.Forms.ListView]@{ Dock = 'Fill'; View = 'Details'; FullR
 [void]$list.Columns.Add('Status', 430)
 $split.Panel1.Controls.Add($list)
 
+$graphHost = [System.Windows.Forms.Panel]@{ Dock = 'Fill'; Visible = $false }
+$graphToolbar = [System.Windows.Forms.Panel]@{ Dock = 'Top'; Height = 70; Padding = [System.Windows.Forms.Padding]::new(6) }
+$graphOrderingToggle = [System.Windows.Forms.CheckBox]@{ Text = 'Ordering'; Left = 8; Top = 9; Width = 75; Checked = $true }
+$graphConflictToggle = [System.Windows.Forms.CheckBox]@{ Text = 'Conflicts'; Left = 88; Top = 9; Width = 75; Checked = $true }
+$graphIntegratedToggle = [System.Windows.Forms.CheckBox]@{ Text = 'Integrated'; Left = 168; Top = 9; Width = 82; Checked = $true }
+$graphFocusBox = [System.Windows.Forms.ComboBox]@{ Left = 260; Top = 6; Width = 145; DropDownStyle = 'DropDownList' }
+[void]$graphFocusBox.Items.AddRange(@('All relationships', 'Selected mod', 'Problems only'))
+$graphUnassignedToggle = [System.Windows.Forms.CheckBox]@{ Text = 'Show unassigned'; Left = 415; Top = 9; Width = 120 }
+$graphZoomOutButton = [System.Windows.Forms.Button]@{ Text = '-'; Left = 8; Top = 38; Width = 30; Height = 27 }
+$graphZoomLabel = [System.Windows.Forms.Label]@{ Text = "$([Math]::Round($script:GraphZoom * 100))%"; Left = 43; Top = 43; Width = 45; TextAlign = 'MiddleCenter' }
+$graphZoomInButton = [System.Windows.Forms.Button]@{ Text = '+'; Left = 93; Top = 38; Width = 30; Height = 27 }
+$graphFitButton = [System.Windows.Forms.Button]@{ Text = 'Fit'; Left = 128; Top = 38; Width = 45; Height = 27 }
+$graphHintLabel = [System.Windows.Forms.Label]@{ Text = 'Left-drag to pan | Ctrl+wheel zoom | Shift+wheel horizontal'; Left = 185; Top = 43; Width = 400; ForeColor = [System.Drawing.Color]::DimGray }
+$graphToolbar.Controls.AddRange(@($graphOrderingToggle, $graphConflictToggle, $graphIntegratedToggle, $graphFocusBox, $graphUnassignedToggle, $graphZoomOutButton, $graphZoomLabel, $graphZoomInButton, $graphFitButton, $graphHintLabel))
+$graphScroll = [System.Windows.Forms.Panel]@{ Dock = 'Fill'; AutoScroll = $true; BackColor = [System.Drawing.Color]::White }
+$graphCanvas = [BufferedGraphPanel]@{ Left = 0; Top = 0; Width = 800; Height = 600; BackColor = [System.Drawing.Color]::White; TabStop = $true; AccessibleName = 'Dependency graph' }
+$graphToolTip = [System.Windows.Forms.ToolTip]::new()
+$script:GraphTooltipNodeId = ''
+$script:GraphPanCandidate = $false
+$script:GraphPanning = $false
+$script:GraphPanStartScreen = [System.Drawing.Point]::Empty
+$script:GraphPanStartScroll = [System.Drawing.Point]::Empty
+$graphScroll.Controls.Add($graphCanvas)
+$graphHost.Controls.Add($graphScroll)
+$graphHost.Controls.Add($graphToolbar)
+$split.Panel1.Controls.Add($graphHost)
+
 $details = [System.Windows.Forms.Panel]@{ Dock = 'Fill'; Padding = [System.Windows.Forms.Padding]::new(12) }
 $selectedLabel = [System.Windows.Forms.Label]@{ Text = 'No mod selected'; Left = 12; Top = 15; Width = 390; Height = 45; Font = [System.Drawing.Font]::new('Segoe UI', 10, [System.Drawing.FontStyle]::Bold) }
 $pathLabel = [System.Windows.Forms.Label]@{ Left = 12; Top = 65; Width = 390; Height = 55; AutoEllipsis = $true }
@@ -1517,7 +2130,8 @@ $dependencySortButton = [System.Windows.Forms.Button]@{ Text = 'Auto-sort...'; L
 $newQueueButton = [System.Windows.Forms.Button]@{ Text = 'New queue'; Left = 12; Top = 335; Width = 120; Height = 30 }
 $renameQueueButton = [System.Windows.Forms.Button]@{ Text = 'Rename queue'; Left = 142; Top = 335; Width = 120; Height = 30 }
 $deleteQueueButton = [System.Windows.Forms.Button]@{ Text = 'Delete queue'; Left = 272; Top = 335; Width = 130; Height = 30 }
-$backupButton = [System.Windows.Forms.Button]@{ Text = 'Manage backups'; Left = 12; Top = 370; Width = 390; Height = 30 }
+$backupButton = [System.Windows.Forms.Button]@{ Text = 'Manage backups'; Left = 12; Top = 370; Width = 190; Height = 30 }
+$deleteModsButton = [System.Windows.Forms.Button]@{ Text = 'Delete selected mods...'; Left = 212; Top = 370; Width = 190; Height = 30; Enabled = $false }
 $restoreBeforeInstallToggle = [System.Windows.Forms.CheckBox]@{ Text = 'Restore game before install'; Left = 12; Top = 410; Width = 390 }
 $asiSelectAllButton = [System.Windows.Forms.Button]@{ Text = 'Select all ASI plugins'; Left = 12; Top = 125; Width = 190; Height = 32; Visible = $false }
 $asiClearAllButton = [System.Windows.Forms.Button]@{ Text = 'Clear ASI plugins'; Left = 212; Top = 125; Width = 190; Height = 32; Visible = $false }
@@ -1528,10 +2142,11 @@ $dependencyBox = [System.Windows.Forms.TextBox]@{ Left = 12; Top = 465; Width = 
 $nexusLabel = [System.Windows.Forms.Label]@{ Text = 'Nexus:'; Left = 12; Top = 623; AutoSize = $true }
 $nexusLink = [System.Windows.Forms.LinkLabel]@{ Text = ''; Left = 62; Top = 620; Width = 340; Height = 22; AutoEllipsis = $true; LinkBehavior = 'HoverUnderline' }
 $hint = [System.Windows.Forms.Label]@{ Text = 'Use Ctrl or Shift to select multiple mods.'; Left = 12; Top = 650; Width = 390; Height = 40 }
-$details.Controls.AddRange(@($selectedLabel, $pathLabel, $creationToggle, $targetLabel, $targetBox, $assignButton, $moveUpButton, $moveDownButton, $mountOrderButton, $dependencySortButton, $newQueueButton, $renameQueueButton, $deleteQueueButton, $backupButton, $restoreBeforeInstallToggle, $asiSelectAllButton, $asiClearAllButton, $asiModeHint, $dependencyLabel, $manageRulesButton, $dependencyBox, $nexusLabel, $nexusLink, $hint))
+$details.Controls.AddRange(@($selectedLabel, $pathLabel, $creationToggle, $targetLabel, $targetBox, $assignButton, $moveUpButton, $moveDownButton, $mountOrderButton, $dependencySortButton, $newQueueButton, $renameQueueButton, $deleteQueueButton, $backupButton, $deleteModsButton, $restoreBeforeInstallToggle, $asiSelectAllButton, $asiClearAllButton, $asiModeHint, $dependencyLabel, $manageRulesButton, $dependencyBox, $nexusLabel, $nexusLink, $hint))
 $split.Panel2.Controls.Add($details)
 $form.Controls.Add($split)
 $form.Controls.Add($top)
+Update-TopBarSummaryLayout
 
 function Set-NexusLink {
     param([string]$Url)
@@ -1596,8 +2211,10 @@ function Get-LocalRuleDetailsText {
 }
 
 function Show-LocalRuleManager {
-    if ($asiEditToggle.Checked -or $list.SelectedItems.Count -ne 1) { return }
-    $subject = $list.SelectedItems[0].Tag
+    if ($asiEditToggle.Checked) { return }
+    $graphMode = [string]$viewBox.SelectedItem -eq 'Dependency Graph'
+    if (-not $graphMode -and $list.SelectedItems.Count -ne 1) { return }
+    $subject = if ($graphMode) { $script:SelectedGraphRecord } else { $list.SelectedItems[0].Tag }
     if ($null -eq $subject -or $null -eq $subject.Facts -or -not $subject.Facts.Exists) {
         [System.Windows.Forms.MessageBox]::Show('Local rules can only be edited for a mod that is currently available.', 'Local rules', 'OK', 'Information')
         return
@@ -1785,6 +2402,183 @@ function Get-AsiMembershipText($record) {
     }) -join '; ')
 }
 
+function Show-ModRecordDetails {
+    param($Record, [string]$OccurrenceText = '')
+
+    if ($null -eq $Record) {
+        $selectedLabel.Text = 'Base Game'
+        $pathLabel.Text = ''
+        $dependencyBox.Text = 'Synthetic starting point for the installation graph.'
+        $manageRulesButton.Enabled = $false
+        Set-NexusLink
+        return
+    }
+    $manageRulesButton.Enabled = [bool]$Record.Facts.Exists
+    $selectedLabel.Text = [string]$Record.Name
+    $pathLabel.Text = [string]$Record.Path
+    Set-NexusLink -Url $Record.Facts.ModSite
+    $targetBox.SelectedIndex = 0
+    if ($null -ne $Record.Target) {
+        for ($index = 1; $index -lt $targetBox.Items.Count; $index++) {
+            if ([int]$targetBox.Items[$index].Stage -eq [int]$Record.Target) { $targetBox.SelectedIndex = $index; break }
+        }
+    }
+    $shownOrder = if ($OccurrenceText) {
+        $OccurrenceText
+    } elseif ($creationEditToggle.Checked) {
+        if ($Record.InCreation) { (Get-RecordCreationOrder $Record) + 1 } else { 'Not in Creation' }
+    } elseif ($null -ne $Record.Target) {
+        (Get-RecordQueueOrder $Record) + 1
+    } else {
+        'Unassigned'
+    }
+    $dependencyBox.Text = "Creation queue: $(if($Record.InCreation){'Yes'}else{'No'})`r`nMod version: $(if($Record.Facts.ModVersion){$Record.Facts.ModVersion}else{'Unknown'})`r`nMount ID: $(if($Record.Facts.MountIds.Count){$Record.Facts.MountIds -join ', '}else{'None'})`r`nQueue order: $shownOrder`r`n`r`nStatus:`r`n$($Record.Status)`r`n`r`nProvides:`r`n$(if($Record.Facts.Provided.Count){$Record.Facts.Provided -join "`r`n"}else{'None'})`r`n`r`nRequired dependencies:`r`n$(if($Record.Facts.Required.Count){$Record.Facts.Required -join "`r`n"}else{'None'})`r`n`r`nOptional or patch detection:`r`n$(if($Record.Facts.Conditional.Count){$Record.Facts.Conditional -join "`r`n"}else{'None'})`r`n`r`nIncompatible DLC:`r`n$(if($Record.Facts.Incompatible.Count){$Record.Facts.Incompatible -join "`r`n"}else{'None'})`r`n`r`nLocal organizer rules:`r`n$(Get-LocalRuleDetailsText $Record)`r`n`r`nDescription:`r`n$(if($Record.Facts.Description){$Record.Facts.Description}else{'No description available.'})"
+}
+
+function Get-ModStatusColors {
+    param($Record)
+    if ($null -eq $Record) { return [pscustomobject]@{ BackColor = [System.Drawing.Color]::LightGray; ForeColor = [System.Drawing.Color]::Black; BorderColor = [System.Drawing.Color]::Gray } }
+    if ($Record.Status -like '*Incompatible with:*') { return [pscustomobject]@{ BackColor = [System.Drawing.Color]::LightCoral; ForeColor = [System.Drawing.Color]::DarkRed; BorderColor = [System.Drawing.Color]::DarkRed } }
+    if ($Record.Status -like 'Present in multiple*') { return [pscustomobject]@{ BackColor = [System.Drawing.Color]::MistyRose; ForeColor = [System.Drawing.Color]::Black; BorderColor = [System.Drawing.Color]::IndianRed } }
+    if ($Record.Status -ne 'OK' -and $Record.Status -ne 'Unassigned') { return [pscustomobject]@{ BackColor = [System.Drawing.Color]::LightYellow; ForeColor = [System.Drawing.Color]::Black; BorderColor = [System.Drawing.Color]::DarkGoldenrod } }
+    if ($Record.Status -eq 'OK') { return [pscustomobject]@{ BackColor = [System.Drawing.Color]::Honeydew; ForeColor = [System.Drawing.Color]::Black; BorderColor = [System.Drawing.Color]::Gray } }
+    return [pscustomobject]@{ BackColor = [System.Drawing.Color]::White; ForeColor = [System.Drawing.Color]::Black; BorderColor = [System.Drawing.Color]::Gray }
+}
+
+function Test-GraphEdgeVisible {
+    param($Edge)
+    if ($Edge.Relationship -eq 'Incompatible') { return $graphConflictToggle.Checked }
+    if ($Edge.Relationship -eq 'IntegratedInto') { return $graphIntegratedToggle.Checked }
+    return $graphOrderingToggle.Checked
+}
+
+function Get-GraphConnectedOccurrenceIds {
+    $connected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if (-not $script:GraphSelectedOccurrenceId -or -not $script:GraphLayout) { return ,$connected }
+    $pending = [System.Collections.Generic.Queue[string]]::new()
+    [void]$connected.Add($script:GraphSelectedOccurrenceId)
+    $pending.Enqueue($script:GraphSelectedOccurrenceId)
+    while ($pending.Count) {
+        $current = $pending.Dequeue()
+        foreach ($edge in @($script:GraphLayout.Edges | Where-Object { Test-GraphEdgeVisible $_ })) {
+            $next = if ($edge.BeforeOccurrenceId -eq $current) { [string]$edge.AfterOccurrenceId } elseif ($edge.AfterOccurrenceId -eq $current) { [string]$edge.BeforeOccurrenceId } else { '' }
+            if ($next -and $connected.Add($next)) { $pending.Enqueue($next) }
+        }
+    }
+    return ,$connected
+}
+
+function Get-GraphPanScrollPosition {
+    param(
+        [System.Drawing.Point]$StartScroll,
+        [System.Drawing.Point]$StartScreen,
+        [System.Drawing.Point]$CurrentScreen
+    )
+    return [System.Drawing.Point]::new(
+        [Math]::Max(0, $StartScroll.X - ($CurrentScreen.X - $StartScreen.X)),
+        [Math]::Max(0, $StartScroll.Y - ($CurrentScreen.Y - $StartScreen.Y))
+    )
+}
+
+function Refresh-DependencyGraph {
+    if (-not $script:State -or $script:State.Game -eq 'All') { return }
+    if (-not $script:State.PSObject.Properties['DependencyModel']) { Update-StateStatus -State $script:State }
+    $model = $script:State.DependencyModel
+    $zoom = [Math]::Max(0.5, [Math]::Min(2.5, [double]$script:GraphZoom))
+    $headerWidth = [int](210 * $zoom)
+    $nodeWidth = [int](185 * $zoom)
+    $nodeHeight = [int](56 * $zoom)
+    $gap = [int](18 * $zoom)
+    $lanePadding = [int](14 * $zoom)
+    $laneHeight = [int](92 * $zoom)
+    $showUnassigned = $graphUnassignedToggle.Checked -or [string]$filterBox.SelectedItem -eq 'Unassigned'
+    $stages = @($model.Stages | Where-Object { $_.Kind -ne 'Unassigned' -or $showUnassigned } | Sort-Object Order)
+    $nodes = [System.Collections.Generic.List[object]]::new()
+    $lanes = [System.Collections.Generic.List[object]]::new()
+    $nodeById = @{}
+    $canvasWidth = 760
+    $y = 8
+    foreach ($stage in $stages) {
+        $stageNodes = [System.Collections.Generic.List[object]]::new()
+        foreach ($occurrence in @($model.Occurrences | Where-Object { $_.StageId -eq $stage.Id } | Sort-Object Order, Name)) {
+            $stageNodes.Add([pscustomobject]@{ Id = [string]$occurrence.Id; Occurrence = $occurrence; Record = $occurrence.Record; Placeholder = $false })
+        }
+        foreach ($placeholder in @($model.PlaceholderNodes | Where-Object { $_.StageId -eq $stage.Id } | Sort-Object Order, Name)) {
+            $stageNodes.Add([pscustomobject]@{ Id = [string]$placeholder.Id; Occurrence = $placeholder; Record = $null; Placeholder = $true })
+        }
+        $laneWidth = $headerWidth + $lanePadding + [Math]::Max(1, $stageNodes.Count) * ($nodeWidth + $gap) + $lanePadding
+        $canvasWidth = [Math]::Max($canvasWidth, $laneWidth)
+        $laneRect = [System.Drawing.Rectangle]::new(0, $y, $laneWidth, $laneHeight)
+        $lanes.Add([pscustomobject]@{ Stage = $stage; Rectangle = $laneRect; NodeCount = $stageNodes.Count })
+        $x = $headerWidth + $lanePadding
+        foreach ($node in $stageNodes) {
+            $rect = [System.Drawing.Rectangle]::new($x, $y + [int](($laneHeight - $nodeHeight) / 2), $nodeWidth, $nodeHeight)
+            $layoutNode = [pscustomobject]@{ Id = $node.Id; Rectangle = $rect; Occurrence = $node.Occurrence; Record = $node.Record; Placeholder = $node.Placeholder; StageId = [string]$stage.Id }
+            $nodes.Add($layoutNode)
+            $nodeById[$layoutNode.Id] = $layoutNode
+            $x += $nodeWidth + $gap
+        }
+        $y += $laneHeight + [int](10 * $zoom)
+    }
+    $visibleEdges = @($model.OccurrenceEdges | Where-Object { $nodeById.ContainsKey($_.BeforeOccurrenceId) -and $nodeById.ContainsKey($_.AfterOccurrenceId) })
+    $script:GraphLayout = [pscustomobject]@{ Model = $model; Lanes = @($lanes); Nodes = @($nodes); NodeById = $nodeById; Edges = $visibleEdges; Zoom = $zoom }
+    $graphCanvas.Size = [System.Drawing.Size]::new([Math]::Max($canvasWidth, $graphScroll.ClientSize.Width - 2), [Math]::Max($y + 8, $graphScroll.ClientSize.Height - 2))
+    $graphZoomLabel.Text = "$([Math]::Round($zoom * 100))%"
+    if ($script:GraphSelectedOccurrenceId -and -not $nodeById.ContainsKey($script:GraphSelectedOccurrenceId)) { $script:GraphSelectedOccurrenceId = ''; $script:SelectedGraphRecord = $null }
+    $assigned = @($script:State.Records.Values | Where-Object { $null -ne $_.Target }).Count
+    Set-SummaryText "$assigned/$($script:State.Records.Count) assigned"
+    $graphCanvas.Invalidate()
+}
+
+function Select-DependencyGraphNode {
+    param($Node)
+    if ($null -eq $Node) { return }
+    $script:GraphSelectedOccurrenceId = [string]$Node.Id
+    $script:SelectedGraphRecord = $Node.Record
+    if ($Node.Placeholder) {
+        $selectedLabel.Text = "Missing: $($Node.Occurrence.Name)"
+        $pathLabel.Text = ''
+        $dependencyBox.Text = "This dependency or local-rule target could not be resolved.`r`n`r`nAffected mod: $($Node.Occurrence.AffectedRecordKey)"
+        $manageRulesButton.Enabled = $false
+        Set-NexusLink
+    } elseif ($null -eq $Node.Record) {
+        Show-ModRecordDetails -Record $null
+    } else {
+        $occurrenceText = switch ([string]$Node.Occurrence.StageKind) {
+            'Creation' { "Creation List, order $([int]$Node.Occurrence.Order + 1)" }
+            'WorkingQueue' { "$($script:State.StageNames[[string]$Node.Occurrence.Stage]), order $([int]$Node.Occurrence.Order + 1)" }
+            default { 'Unassigned' }
+        }
+        Show-ModRecordDetails -Record $Node.Record -OccurrenceText $occurrenceText
+    }
+    $graphCanvas.AccessibleDescription = "Selected $($Node.Occurrence.Name)"
+    $graphCanvas.Invalidate()
+}
+
+function Set-OrganizerViewMode {
+    $graphMode = [string]$viewBox.SelectedItem -eq 'Dependency Graph'
+    if ($graphMode -and ($null -eq $script:State -or $script:State.Game -eq 'All' -or $asiEditToggle.Checked -or $creationEditToggle.Checked)) {
+        $script:UpdatingViewMode = $true
+        $viewBox.SelectedItem = 'List'
+        $script:UpdatingViewMode = $false
+        $graphMode = $false
+    }
+    $list.Visible = -not $graphMode
+    $graphHost.Visible = $graphMode
+    $graphHost.BringToFront()
+    $sortBox.Enabled = -not $graphMode -and -not $asiEditToggle.Checked
+    if ($graphMode) {
+        Refresh-DependencyGraph
+        $graphCanvas.Focus()
+    } else {
+        $list.BringToFront()
+    }
+    Update-ModeControls
+    Update-AssignButtonState
+    Update-MoveButtons
+    Update-RestoreBeforeInstallToggle
+}
+
 function Set-ListMode {
     $asiMode = $asiEditToggle.Checked
     $headers = if ($asiMode) {
@@ -1815,17 +2609,28 @@ function Set-FilterItemsForMode {
 function Update-ModeControls {
     $asiMode = $asiEditToggle.Checked
     $creationMode = $creationEditToggle.Checked
-    foreach ($control in @($creationToggle, $targetLabel, $targetBox, $assignButton, $moveUpButton, $moveDownButton, $mountOrderButton, $dependencySortButton, $newQueueButton, $renameQueueButton, $deleteQueueButton, $manageRulesButton)) { $control.Visible = -not $asiMode }
+    $graphMode = [string]$viewBox.SelectedItem -eq 'Dependency Graph'
+    foreach ($control in @($creationToggle, $targetLabel, $targetBox, $assignButton, $moveUpButton, $moveDownButton, $mountOrderButton, $dependencySortButton, $newQueueButton, $renameQueueButton, $deleteQueueButton, $deleteModsButton, $manageRulesButton)) { $control.Visible = -not $asiMode }
     foreach ($control in @($asiSelectAllButton, $asiClearAllButton, $asiModeHint)) { $control.Visible = $asiMode }
     $asiSelectAllButton.Enabled = $asiMode -and $script:State -and $script:State.Game -ne 'All' -and $queueFilterBox.SelectedIndex -gt 0
     $asiClearAllButton.Enabled = $asiSelectAllButton.Enabled
-    $renameQueueButton.Enabled = -not $asiMode -and $script:State -and $script:State.Game -ne 'All' -and -not $creationMode -and $queueFilterBox.SelectedIndex -gt 0 -and [int]$queueFilterBox.SelectedItem.Stage -gt 0
-    $sortBox.Enabled = -not $asiMode
-    $creationEditToggle.Enabled = -not ($script:State -and $script:State.Game -eq 'All')
-    $asiEditToggle.Enabled = $null -ne $script:State
+    $renameQueueButton.Enabled = -not $graphMode -and -not $asiMode -and $script:State -and $script:State.Game -ne 'All' -and -not $creationMode -and $queueFilterBox.SelectedIndex -gt 0 -and [int]$queueFilterBox.SelectedItem.Stage -gt 0
+    $sortBox.Enabled = -not $graphMode -and -not $asiMode
+    $creationEditToggle.Enabled = -not $graphMode -and -not ($script:State -and $script:State.Game -eq 'All')
+    $asiEditToggle.Enabled = -not $graphMode -and $null -ne $script:State
+    $viewBox.Enabled = $script:State -and $script:State.Game -ne 'All' -and -not $asiMode -and -not $creationMode
+    if ($graphMode) {
+        foreach ($control in @($creationToggle, $targetBox, $assignButton, $moveUpButton, $moveDownButton, $mountOrderButton, $dependencySortButton, $newQueueButton, $renameQueueButton, $deleteQueueButton, $deleteModsButton, $restoreBeforeInstallToggle)) { $control.Enabled = $false }
+        $hint.Text = 'Dependency Graph is read-only. Select a node to inspect details and local rules.'
+    } elseif (-not $asiMode) {
+        $targetBox.Enabled = -not $creationMode
+        $newQueueButton.Enabled = $script:State -and $script:State.Game -ne 'All' -and -not $creationMode
+        $deleteQueueButton.Enabled = $newQueueButton.Enabled -and $queueFilterBox.SelectedIndex -gt 0
+        $creationToggle.Enabled = $creationMode
+    }
     if ($asiMode) {
         $hint.Text = 'Check or uncheck ASI plugins for the selected queue. Developer tools are marked separately.'
-    } else {
+    } elseif (-not $graphMode) {
         $hint.Text = 'Use Ctrl or Shift to select multiple mods.'
     }
     if ($list.SelectedItems.Count -eq 0) {
@@ -1836,11 +2641,22 @@ function Update-ModeControls {
         $manageRulesButton.Enabled = $false
     }
     Set-ListMode
+    Update-DeleteModsButtonState
+}
+
+function Update-DeleteModsButtonState {
+    $deleteModsButton.Enabled = $false
+    if (-not $script:State -or $asiEditToggle.Checked -or [string]$viewBox.SelectedItem -eq 'Dependency Graph' -or $script:State.Dirty) { return }
+    $selectedRecords = @($list.SelectedItems | ForEach-Object { $_.Tag } | Where-Object { $null -ne $_ })
+    if (-not $selectedRecords.Count) { return }
+    if (@($selectedRecords | Where-Object { $_.Game -notin @('LE1', 'LE2', 'LE3') -or -not $_.Facts.Exists }).Count) { return }
+    $deleteModsButton.Enabled = $true
 }
 
 function Update-AssignButtonState {
+    Update-DeleteModsButtonState
     if (-not $script:State) { return }
-    if ($asiEditToggle.Checked) { $assignButton.Enabled = $false; return }
+    if ($asiEditToggle.Checked -or [string]$viewBox.SelectedItem -eq 'Dependency Graph') { $assignButton.Enabled = $false; return }
     if ($script:State.Game -eq 'All') {
         $assignButton.Text = 'Remove selected missing mods'
         $selectedRecords = @($list.SelectedItems | ForEach-Object { $_.Tag })
@@ -1888,7 +2704,7 @@ function Update-RestoreBeforeInstallToggle {
     $script:UpdatingRestoreToggle = $true
     $restoreBeforeInstallToggle.Checked = $false
     $restoreBeforeInstallToggle.Enabled = $false
-    if ($script:State -and $script:State.Game -ne 'All') {
+    if ($script:State -and $script:State.Game -ne 'All' -and [string]$viewBox.SelectedItem -ne 'Dependency Graph') {
         $stage = if ($creationEditToggle.Checked) { 0 } elseif ($queueFilterBox.SelectedIndex -gt 0) { [int]$queueFilterBox.SelectedItem.Stage } else { -1 }
         if ($stage -ge 0 -and $script:State.Queues.ContainsKey([string]$stage)) {
             $restoreBeforeInstallToggle.Checked = $script:State.Queues[[string]$stage].Data.restorebeforeinstall -eq $true
@@ -1975,7 +2791,7 @@ function Refresh-AsiList {
             $visible++
         }
         $assigned = @($script:State.AsiRecords.Values | Where-Object { $_.Memberships.Count -gt 0 }).Count
-        $summaryLabel.Text = "$visible visible | $assigned/$($script:State.AsiRecords.Count) used"
+        Set-SummaryText "$visible visible | $assigned/$($script:State.AsiRecords.Count) used"
         $activeSetLabel.Text = if ($null -ne $stage -and [int]$stage -eq 0) { 'Editing ASI plugins in the separate Creation List.' } else { "Viewing ASI plugins for: $($script:State.SetName)." }
     } finally {
         $list.EndUpdate()
@@ -1985,6 +2801,7 @@ function Refresh-AsiList {
 
 function Refresh-List {
     param([hashtable]$PreserveSelection, [switch]$PreserveViewport)
+    if ([string]$viewBox.SelectedItem -eq 'Dependency Graph') { Refresh-DependencyGraph; return }
     if ($asiEditToggle.Checked) { Refresh-AsiList -PreserveSelection $PreserveSelection; return }
     $preservedTopKey = ''
     $preservedTopIndex = -1
@@ -2026,18 +2843,14 @@ function Refresh-List {
         [void]$item.SubItems.Add($record.Status)
         $item.Tag = $record
         if ($PreserveSelection -and $PreserveSelection.ContainsKey($record.Key)) { $item.Selected = $true }
-        if ($record.Status -like '*Incompatible with:*') {
-            $item.BackColor = [System.Drawing.Color]::LightCoral
-            $item.ForeColor = [System.Drawing.Color]::DarkRed
-        }
-        elseif ($record.Status -like 'Present in multiple*') { $item.BackColor = [System.Drawing.Color]::MistyRose }
-        elseif ($record.Status -ne 'OK' -and $record.Status -ne 'Unassigned') { $item.BackColor = [System.Drawing.Color]::LightYellow }
-        elseif ($record.Status -eq 'OK') { $item.BackColor = [System.Drawing.Color]::Honeydew }
+        $statusColors = Get-ModStatusColors -Record $record
+        $item.BackColor = $statusColors.BackColor
+        $item.ForeColor = $statusColors.ForeColor
         [void]$list.Items.Add($item)
         $visible++
     }
     $assigned = @($script:State.Records.Values | Where-Object { $null -ne $_.Target }).Count
-    $summaryLabel.Text = "$visible visible | $assigned/$($script:State.Records.Count) assigned"
+    Set-SummaryText "$visible visible | $assigned/$($script:State.Records.Count) assigned"
     $activeSetLabel.Text = if ($creationEditToggle.Checked -and $script:State.Game -ne 'All') { 'Editing the separate Creation List.' } else { "Viewing: $($script:State.SetName). ME3Tweaks activation is independent." }
     $list.EndUpdate()
     $restoredTopItem = $null
@@ -2092,6 +2905,10 @@ function Load-SelectedGame {
         }
     }
     Refresh-QueueSelectors
+    $script:UpdatingViewMode = $true
+    $viewBox.SelectedItem = if ($selectedGame -eq 'All') { 'List' } else { $script:PreferredViewMode }
+    $script:UpdatingViewMode = $false
+    Set-OrganizerViewMode
     Refresh-List
     return $true
 }
@@ -2110,6 +2927,10 @@ function Load-SelectedSet {
     $script:State = if ($game -eq 'All') { Get-AllGameState -SetId $setId } else { Get-GameState -Game $game -SetId $setId }
     Refresh-SetSelector -PreferredSetId $setId
     Refresh-QueueSelectors
+    $script:UpdatingViewMode = $true
+    $viewBox.SelectedItem = if ($game -eq 'All') { 'List' } else { $script:PreferredViewMode }
+    $script:UpdatingViewMode = $false
+    Set-OrganizerViewMode
     Refresh-List
 }
 
@@ -2142,8 +2963,8 @@ function Load-ActiveSet {
 function New-ManagedQueueFile {
     param([ValidateSet('LE1', 'LE2', 'LE3')][string]$Game, [string]$SetId = 'default', [string]$SetName = 'Default', [int]$Order, [string]$Name, $TemplateData = $null)
     $fileName = if ($Order -eq 0 -or $SetId -eq 'default') { "$Game.$Order - $Name.biq2" } else { "$Game.$SetId.$Order - $Name.biq2" }
-    $activeSetId = Get-ActiveSetId
-    $destinationDirectory = if ($Order -eq 0 -or $SetId -eq $activeSetId) { $script:QueueRoot } else { Join-Path (Join-Path $script:InactiveQueueRoot $Game) $SetId }
+    $effectiveSetId = if ($Order -eq 0) { 'creation' } else { $SetId }
+    $destinationDirectory = Get-OrganizerQueueStoreDirectory -Game $Game -SetId $effectiveSetId
     [void](New-Item -ItemType Directory -Path $destinationDirectory -Force)
     $path = Join-Path $destinationDirectory $fileName
     if (Test-Path -LiteralPath $path) { return $path }
@@ -2166,6 +2987,7 @@ function New-ManagedQueueFile {
     }
     [System.IO.File]::WriteAllText($path, (($queue | ConvertTo-Json -Depth 20) + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
     Set-QueueRegistryEntry -Game $Game -SetId $SetId -SetName $SetName -Order $Order -Name $Name -QueueName $queueName -FileName (Split-Path $path -Leaf)
+    if ($Order -eq 0 -or $SetId -eq (Get-ActiveSetId)) { Sync-ActiveOrganizerQueues }
     return $path
 }
 
@@ -2275,20 +3097,15 @@ function Remove-OrganizerSet {
     $answer = [System.Windows.Forms.MessageBox]::Show("Delete global set '$setName' and its $($entries.Count) queue(s) across LE1, LE2 and LE3?`r`n`r`nThe global Creation Lists are not affected. A backup will be created first.", 'Confirm set deletion', 'YesNo', 'Warning')
     if ($answer -ne 'Yes') { return }
     if ((Get-ActiveSetId) -eq $setId) { Set-ActiveOrganizerSet -SetId 'default' }
-    $backupRoot = Join-Path $script:QueueRoot ("OrganizerBackups\{0}-delete-global-set-{1}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $setId)
+    $backupRoot = Join-Path $script:BackupRoot ("{0}-delete-global-set-{1}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $setId)
     [void](New-Item -ItemType Directory -Path $backupRoot -Force)
     foreach ($entry in $entries) {
-        $candidates = @(Join-Path $script:QueueRoot ([string]$entry.FileName))
-        if (Test-Path -LiteralPath $script:InactiveQueueRoot) { $candidates += @(Get-ChildItem -LiteralPath $script:InactiveQueueRoot -Filter ([string]$entry.FileName) -File -Recurse | ForEach-Object { $_.FullName }) }
-        $existingPath = @($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
-        if (-not $existingPath.Count) { continue }
-        $path = (Resolve-Path -LiteralPath $existingPath[0]).Path
-        $queueRootPath = (Resolve-Path -LiteralPath $script:QueueRoot).Path
-        $inactiveRootPath = if (Test-Path -LiteralPath $script:InactiveQueueRoot) { (Resolve-Path -LiteralPath $script:InactiveQueueRoot).Path } else { '' }
+        $storePath = Get-OrganizerQueueStorePath -Entry $entry
+        if (-not (Test-Path -LiteralPath $storePath -PathType Leaf)) { continue }
+        $path = (Resolve-Path -LiteralPath $storePath).Path
+        $storeRootPath = (Resolve-Path -LiteralPath $script:OrganizerQueueStoreRoot).Path
         $pathParent = Split-Path $path -Parent
-        if ($pathParent -ne $queueRootPath -and (-not $inactiveRootPath -or -not $pathParent.StartsWith($inactiveRootPath + [System.IO.Path]::DirectorySeparatorChar))) {
-            throw "Refusing to delete a set queue outside organizer-managed locations: $path"
-        }
+        if (-not $pathParent.StartsWith($storeRootPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Refusing to delete a set queue outside the Organizer queue store: $path" }
         $backupName = "$($entry.Game)-$(Split-Path $path -Leaf)"
         Copy-Item -LiteralPath $path -Destination (Join-Path $backupRoot $backupName)
         Remove-Item -LiteralPath $path
@@ -2297,6 +3114,7 @@ function Remove-OrganizerSet {
     $script:SetRegistry = @($script:SetRegistry | Where-Object { $_.Id -ne $setId })
     Save-QueueRegistry
     Save-SetRegistry
+    Sync-ActiveOrganizerQueues
     $nextSet = @(Get-OrganizerSets | Select-Object -First 1)[0]
     Refresh-SetSelector -PreferredSetId $nextSet.Id
     $script:State = if ($script:State.Game -eq 'All') { Get-AllGameState -SetId $nextSet.Id } else { Get-GameState -Game $script:State.Game -SetId $nextSet.Id }
@@ -2348,11 +3166,12 @@ function Remove-FilteredQueue {
     $resolvedRoot = (Resolve-Path -LiteralPath (Split-Path $queueInfo.Path -Parent)).Path
     $resolvedFile = (Resolve-Path -LiteralPath $queueInfo.Path).Path
     if ((Split-Path $resolvedFile -Parent) -ne $resolvedRoot) { throw "Refusing to delete a queue outside the managed queue directory: $resolvedFile" }
-    $backupRoot = Join-Path $script:QueueRoot ("OrganizerBackups\{0}-delete-{1}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $script:State.Game)
+    $backupRoot = Join-Path $script:BackupRoot ("{0}-delete-{1}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $script:State.Game)
     [void](New-Item -ItemType Directory -Path $backupRoot -Force)
     Copy-Item -LiteralPath $resolvedFile -Destination (Join-Path $backupRoot (Split-Path $resolvedFile -Leaf))
     Remove-Item -LiteralPath $resolvedFile
     Remove-QueueRegistryEntry -Game $script:State.Game -SetId $script:State.SetId -Order $stage
+    Sync-ActiveOrganizerQueues
     $script:State = Get-GameState -Game $script:State.Game -SetId $script:State.SetId
     Refresh-QueueSelectors
     Refresh-List
@@ -2380,11 +3199,8 @@ function Rename-FilteredQueue {
     $queueInfo = $script:State.Queues[[string]$stage]
     $oldPath = (Resolve-Path -LiteralPath $queueInfo.Path).Path
     $queueDirectory = Split-Path $oldPath -Parent
-    $resolvedQueueRoot = [System.IO.Path]::GetFullPath($script:QueueRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
-    $resolvedInactiveRoot = [System.IO.Path]::GetFullPath($script:InactiveQueueRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
-    $allowedDirectory = $queueDirectory -ieq $resolvedQueueRoot -or
-        $queueDirectory.StartsWith($resolvedInactiveRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
-    if (-not $allowedDirectory) { throw "Refusing to rename a queue outside the managed queue directories: $oldPath" }
+    $resolvedStoreRoot = [System.IO.Path]::GetFullPath($script:OrganizerQueueStoreRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    if (-not $queueDirectory.StartsWith($resolvedStoreRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Refusing to rename a queue outside the Organizer queue store: $oldPath" }
     $fileName = if ($script:State.SetId -eq 'default') {
         "$($script:State.Game).$stage - $newName.biq2"
     } else {
@@ -2409,7 +3225,7 @@ function Rename-FilteredQueue {
     )
     if ($answer -ne 'Yes') { return }
 
-    $backupRoot = Join-Path $script:QueueRoot ("OrganizerBackups\{0}-rename-{1}-{2}-{3}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $script:State.Game, $script:State.SetId, $stage)
+    $backupRoot = Join-Path $script:BackupRoot ("{0}-rename-{1}-{2}-{3}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $script:State.Game, $script:State.SetId, $stage)
     [void](New-Item -ItemType Directory -Path $backupRoot -Force)
     Copy-Item -LiteralPath $oldPath -Destination (Join-Path $backupRoot (Split-Path $oldPath -Leaf))
 
@@ -2427,6 +3243,7 @@ function Rename-FilteredQueue {
     }
     Set-QueueRegistryEntry -Game $script:State.Game -SetId $script:State.SetId -SetName $script:State.SetName -Order $stage -Name $newName -QueueName $queueName -FileName $fileName
     Save-QueueRegistry
+    Sync-ActiveOrganizerQueues
     $script:State = Get-GameState -Game $script:State.Game -SetId $script:State.SetId
     Refresh-QueueSelectors
     for ($index = 1; $index -lt $queueFilterBox.Items.Count; $index++) {
@@ -2437,7 +3254,7 @@ function Rename-FilteredQueue {
 }
 
 function Show-BackupManager {
-    $backupRoot = Join-Path $script:QueueRoot 'OrganizerBackups'
+    $backupRoot = $script:BackupRoot
     [void](New-Item -ItemType Directory -Path $backupRoot -Force)
     $dialog = [System.Windows.Forms.Form]@{ Text = 'Organizer Backup Manager'; Width = 900; Height = 520; StartPosition = 'CenterParent'; MinimizeBox = $false; MaximizeBox = $false }
     if (Test-Path -LiteralPath $iconPath) { $dialog.Icon = [System.Drawing.Icon]::new($iconPath) }
@@ -2510,8 +3327,7 @@ function Show-BackupManager {
             $data | Add-Member -NotePropertyName organizerRole -NotePropertyValue $(if ($restoreOrder -eq 0) { 'Creation' } else { 'Assignment' }) -Force
             $data | Add-Member -NotePropertyName organizerSetId -NotePropertyValue $restoreSetId -Force
             $data | Add-Member -NotePropertyName organizerSetName -NotePropertyValue $restoreSetName -Force
-            $activeSetId = if ($restoreOrder -eq 0) { 'creation' } else { Get-ActiveSetId }
-            $destinationDirectory = if ($restoreOrder -eq 0 -or $restoreSetId -eq $activeSetId) { $script:QueueRoot } else { Join-Path (Join-Path $script:InactiveQueueRoot $restoreGame) $restoreSetId }
+            $destinationDirectory = Get-OrganizerQueueStoreDirectory -Game $restoreGame -SetId $restoreSetId
             [void](New-Item -ItemType Directory -Path $destinationDirectory -Force)
             $destination = Join-Path $destinationDirectory $sourceFile.Name
             if (Test-Path -LiteralPath $destination) { Copy-Item -LiteralPath $destination -Destination (Join-Path $safetyDirectory $sourceFile.Name) }
@@ -2521,6 +3337,7 @@ function Show-BackupManager {
         }
         Save-QueueRegistry
         Save-SetRegistry
+        Sync-ActiveOrganizerQueues
         $script:State = if ($script:State.Game -eq 'All') { Get-AllGameState -SetId $script:State.SetId } else { Get-GameState -Game $script:State.Game -SetId $script:State.SetId }
         Refresh-SetSelector -PreferredSetId $script:State.SetId
         Refresh-QueueSelectors
@@ -2724,11 +3541,12 @@ function Show-AutoSortDialog {
 }
 
 function Update-MoveButtons {
-    $enabled = -not $asiEditToggle.Checked -and $script:State -and $script:State.Game -ne 'All' -and ($creationEditToggle.Checked -or $queueFilterBox.SelectedIndex -gt 0)
+    $graphMode = [string]$viewBox.SelectedItem -eq 'Dependency Graph'
+    $enabled = -not $graphMode -and -not $asiEditToggle.Checked -and $script:State -and $script:State.Game -ne 'All' -and ($creationEditToggle.Checked -or $queueFilterBox.SelectedIndex -gt 0)
     $moveUpButton.Enabled = $enabled
     $moveDownButton.Enabled = $enabled
     $mountOrderButton.Enabled = $enabled
-    $dependencySortButton.Enabled = -not $asiEditToggle.Checked -and $script:State -and $script:State.Game -ne 'All' -and -not $creationEditToggle.Checked -and @($script:State.StageNames.Keys | Where-Object { [int]$_ -gt 0 }).Count -gt 0
+    $dependencySortButton.Enabled = -not $graphMode -and -not $asiEditToggle.Checked -and $script:State -and $script:State.Game -ne 'All' -and -not $creationEditToggle.Checked -and @($script:State.StageNames.Keys | Where-Object { [int]$_ -gt 0 }).Count -gt 0
 }
 
 $list.add_ItemDrag({
@@ -2774,6 +3592,192 @@ $list.add_DragDrop({ param($sender, $eventArgs)
     Refresh-List -PreserveSelection $selectedKeys
 })
 
+$graphCanvas.add_Paint({ param($sender, $eventArgs)
+    if (-not $script:GraphLayout) { return }
+    $graphics = $eventArgs.Graphics
+    $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $zoom = [double]$script:GraphLayout.Zoom
+    $titleFont = [System.Drawing.Font]::new('Segoe UI', [float][Math]::Max(8, 9.5 * $zoom), [System.Drawing.FontStyle]::Bold)
+    $smallFont = [System.Drawing.Font]::new('Segoe UI', [float][Math]::Max(7, 8 * $zoom))
+    $nodeFont = [System.Drawing.Font]::new('Segoe UI', [float][Math]::Max(7.5, 8.5 * $zoom), [System.Drawing.FontStyle]::Regular)
+    try {
+        $laneIndex = 0
+        foreach ($lane in $script:GraphLayout.Lanes) {
+            $laneColor = if (($laneIndex % 2) -eq 0) { [System.Drawing.Color]::FromArgb(248, 249, 250) } else { [System.Drawing.Color]::FromArgb(238, 243, 246) }
+            $laneBrush = [System.Drawing.SolidBrush]::new($laneColor)
+            try { $graphics.FillRectangle($laneBrush, $lane.Rectangle) } finally { $laneBrush.Dispose() }
+            $graphics.DrawLine([System.Drawing.Pens]::LightGray, 0, $lane.Rectangle.Bottom - 1, $lane.Rectangle.Right, $lane.Rectangle.Bottom - 1)
+            $graphics.DrawString([string]$lane.Stage.Name, $titleFont, [System.Drawing.Brushes]::Black, [float]12, [float]($lane.Rectangle.Top + 15))
+            $stageText = switch ([string]$lane.Stage.Kind) { 'BaseGame' { 'Starting state' } 'Creation' { 'Installs before every set' } 'Unassigned' { 'Not in the install path' } default { "Queue $($lane.Stage.Order) | $($lane.NodeCount) item(s)" } }
+            $graphics.DrawString($stageText, $smallFont, [System.Drawing.Brushes]::DimGray, [float]12, [float]($lane.Rectangle.Top + 38 * $zoom))
+            $laneIndex++
+        }
+
+        $connected = Get-GraphConnectedOccurrenceIds
+        $focusMode = [string]$graphFocusBox.SelectedItem
+        if ([string]$filterBox.SelectedItem -eq 'Problems') { $focusMode = 'Problems only' }
+        foreach ($edge in $script:GraphLayout.Edges) {
+            if (-not (Test-GraphEdgeVisible $edge)) { continue }
+            $before = $script:GraphLayout.NodeById[$edge.BeforeOccurrenceId]
+            $after = $script:GraphLayout.NodeById[$edge.AfterOccurrenceId]
+            if ($null -eq $before -or $null -eq $after) { continue }
+            $highlighted = $script:GraphSelectedOccurrenceId -and ($connected.Contains($edge.BeforeOccurrenceId) -and $connected.Contains($edge.AfterOccurrenceId))
+            $alpha = if ($focusMode -eq 'Selected mod') { $(if ($highlighted) { 220 } else { 22 }) } elseif ($highlighted) { 210 } else { 70 }
+            $color = switch ([string]$edge.Relationship) {
+                'Incompatible' { [System.Drawing.Color]::FromArgb($alpha, 180, 25, 35) }
+                'IntegratedInto' { [System.Drawing.Color]::FromArgb($alpha, 205, 105, 15) }
+                'LoadAfter' { [System.Drawing.Color]::FromArgb($alpha, 105, 70, 160) }
+                default { [System.Drawing.Color]::FromArgb($alpha, 35, 105, 155) }
+            }
+            $pen = [System.Drawing.Pen]::new($color, [float]$(if ($highlighted) { 2.8 } else { 1.5 }))
+            try {
+                if ($edge.Relationship -eq 'LoadAfter') { $pen.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dash }
+                elseif ($edge.Relationship -eq 'IntegratedInto') { $pen.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dot }
+                if ($edge.Relationship -ne 'Incompatible') { $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::ArrowAnchor }
+                $start = [System.Drawing.PointF]::new([float]($before.Rectangle.Left + $before.Rectangle.Width / 2), [float]$before.Rectangle.Bottom)
+                $finish = [System.Drawing.PointF]::new([float]($after.Rectangle.Left + $after.Rectangle.Width / 2), [float]$after.Rectangle.Top)
+                if ($before.StageId -eq $after.StageId) {
+                    $archY = [float]([Math]::Max(2, $before.Rectangle.Top - 16 * $zoom))
+                    $graphics.DrawBezier($pen, $start, [System.Drawing.PointF]::new($start.X, $archY), [System.Drawing.PointF]::new($finish.X, $archY), $finish)
+                } else {
+                    $middleY = [float](($start.Y + $finish.Y) / 2)
+                    $graphics.DrawBezier($pen, $start, [System.Drawing.PointF]::new($start.X, $middleY), [System.Drawing.PointF]::new($finish.X, $middleY), $finish)
+                }
+            } finally { $pen.Dispose() }
+        }
+
+        $search = $searchBox.Text.Trim()
+        $modFilter = [string]$filterBox.SelectedItem
+        $queueFocus = if ($queueFilterBox.SelectedIndex -gt 0) { "queue:$([int]$queueFilterBox.SelectedItem.Stage)" } else { '' }
+        foreach ($node in $script:GraphLayout.Nodes) {
+            $record = $node.Record
+            $problem = $node.Placeholder -or ($null -ne $record -and $record.Status -ne 'OK' -and $record.Status -ne 'Unassigned')
+            $dimmed = ($focusMode -eq 'Selected mod' -and $script:GraphSelectedOccurrenceId -and -not $connected.Contains($node.Id)) -or
+                ($focusMode -eq 'Problems only' -and -not $problem) -or
+                ($modFilter -eq 'Unassigned' -and $node.Occurrence.StageKind -ne 'Unassigned') -or
+                ($modFilter -eq 'Duplicates' -and ($null -eq $record -or $record.Memberships.Count -le 1)) -or
+                ($modFilter -eq 'Only OK' -and ($null -eq $record -or $record.Status -ne 'OK')) -or
+                ($queueFocus -and $node.StageId -ne $queueFocus) -or
+                ($search -and $node.Occurrence.Name -notlike "*$search*")
+            $statusColors = Get-ModStatusColors -Record $record
+            $fill = if ($node.Placeholder) { [System.Drawing.Color]::Gainsboro } else { $statusColors.BackColor }
+            if ($dimmed) { $fill = [System.Drawing.Color]::FromArgb(75, $fill) }
+            $brush = [System.Drawing.SolidBrush]::new($fill)
+            $borderColor = if ($node.Id -eq $script:GraphSelectedOccurrenceId) { [System.Drawing.Color]::DodgerBlue } elseif ($node.Placeholder) { [System.Drawing.Color]::DimGray } else { $statusColors.BorderColor }
+            $border = [System.Drawing.Pen]::new($borderColor, [float]$(if ($node.Id -eq $script:GraphSelectedOccurrenceId) { 3 } else { 1 }))
+            try {
+                $graphics.FillRectangle($brush, $node.Rectangle)
+                $graphics.DrawRectangle($border, $node.Rectangle)
+                $nameRect = [System.Drawing.RectangleF]::new([float]($node.Rectangle.Left + 4), [float]($node.Rectangle.Top + 4), [float]($node.Rectangle.Width - 8), [float]($node.Rectangle.Height - 22 * $zoom))
+                $format = [System.Drawing.StringFormat]::new()
+                $format.Alignment = [System.Drawing.StringAlignment]::Center
+                $format.LineAlignment = [System.Drawing.StringAlignment]::Center
+                $format.Trimming = [System.Drawing.StringTrimming]::EllipsisWord
+                $graphics.DrawString([string]$node.Occurrence.Name, $nodeFont, [System.Drawing.Brushes]::Black, $nameRect, $format)
+                $format.Dispose()
+                $meta = if ($node.Placeholder) { 'Missing target' } elseif ($null -eq $record) { 'No mods installed' } elseif ($node.Occurrence.StageKind -eq 'Unassigned') { 'Unassigned' } else { "Order $([int]$node.Occurrence.Order + 1) | Mount $(if($record.Facts.MountIds.Count){$record.Facts.MountIds[0]}else{'-'})" }
+                $graphics.DrawString($meta, $smallFont, [System.Drawing.Brushes]::DimGray, [float]($node.Rectangle.Left + 5), [float]($node.Rectangle.Bottom - 17 * $zoom))
+            } finally { $brush.Dispose(); $border.Dispose() }
+        }
+    } finally {
+        $titleFont.Dispose(); $smallFont.Dispose(); $nodeFont.Dispose()
+    }
+})
+
+$graphCanvas.add_MouseDown({ param($sender, $eventArgs)
+    if (-not $script:GraphLayout -or $eventArgs.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+    $graphCanvas.Focus()
+    $script:GraphPanCandidate = $true
+    $script:GraphPanning = $false
+    $script:GraphPanStartScreen = [System.Windows.Forms.Cursor]::Position
+    $script:GraphPanStartScroll = [System.Drawing.Point]::new(-$graphScroll.AutoScrollPosition.X, -$graphScroll.AutoScrollPosition.Y)
+    $graphCanvas.Capture = $true
+})
+
+$graphCanvas.add_MouseMove({ param($sender, $eventArgs)
+    if (-not $script:GraphLayout) { return }
+    if ($script:GraphPanCandidate -and (([System.Windows.Forms.Control]::MouseButtons -band [System.Windows.Forms.MouseButtons]::Left) -eq [System.Windows.Forms.MouseButtons]::Left)) {
+        $currentScreen = [System.Windows.Forms.Cursor]::Position
+        $deltaX = [Math]::Abs($currentScreen.X - $script:GraphPanStartScreen.X)
+        $deltaY = [Math]::Abs($currentScreen.Y - $script:GraphPanStartScreen.Y)
+        $dragSize = [System.Windows.Forms.SystemInformation]::DragSize
+        if (-not $script:GraphPanning -and ($deltaX -ge [Math]::Max(2, [int]($dragSize.Width / 2)) -or $deltaY -ge [Math]::Max(2, [int]($dragSize.Height / 2)))) {
+            $script:GraphPanning = $true
+            $graphCanvas.Cursor = [System.Windows.Forms.Cursors]::SizeAll
+            $script:GraphTooltipNodeId = ''
+            $graphToolTip.Hide($graphCanvas)
+        }
+        if ($script:GraphPanning) {
+            $graphScroll.AutoScrollPosition = Get-GraphPanScrollPosition -StartScroll $script:GraphPanStartScroll -StartScreen $script:GraphPanStartScreen -CurrentScreen $currentScreen
+            return
+        }
+    }
+    $hit = @($script:GraphLayout.Nodes | Where-Object { $_.Rectangle.Contains($eventArgs.Location) } | Select-Object -Last 1)
+    $nodeId = if ($hit.Count) { [string]$hit[0].Id } else { '' }
+    if ($nodeId -eq $script:GraphTooltipNodeId) { return }
+    $script:GraphTooltipNodeId = $nodeId
+    if (-not $hit.Count) { $graphToolTip.Hide($graphCanvas); return }
+    $node = $hit[0]
+    $tooltipText = if ($node.Placeholder) {
+        "Missing target: $($node.Occurrence.Name)"
+    } elseif ($null -eq $node.Record) {
+        'Base Game - no mods installed'
+    } else {
+        "$($node.Record.Name)`r`n$($node.Occurrence.StageKind): $($node.Occurrence.StageId)`r`nOrder: $([int]$node.Occurrence.Order + 1)`r`nMount ID: $(if($node.Record.Facts.MountIds.Count){$node.Record.Facts.MountIds -join ', '}else{'None'})`r`n$($node.Record.Status)"
+    }
+    $graphToolTip.Show($tooltipText, $graphCanvas, $eventArgs.X + 14, $eventArgs.Y + 18, 5000)
+})
+
+$graphCanvas.add_MouseUp({ param($sender, $eventArgs)
+    if ($eventArgs.Button -ne [System.Windows.Forms.MouseButtons]::Left -or -not $script:GraphPanCandidate) { return }
+    $wasPanning = $script:GraphPanning
+    $script:GraphPanCandidate = $false
+    $script:GraphPanning = $false
+    $graphCanvas.Capture = $false
+    $graphCanvas.Cursor = [System.Windows.Forms.Cursors]::Default
+    if ($wasPanning -or -not $script:GraphLayout) { return }
+    $hit = @($script:GraphLayout.Nodes | Where-Object { $_.Rectangle.Contains($eventArgs.Location) } | Select-Object -Last 1)
+    if ($hit.Count) { Select-DependencyGraphNode -Node $hit[0] }
+})
+
+$graphCanvas.add_MouseCaptureChanged({
+    if (-not $graphCanvas.Capture -and $script:GraphPanCandidate -and (([System.Windows.Forms.Control]::MouseButtons -band [System.Windows.Forms.MouseButtons]::Left) -ne [System.Windows.Forms.MouseButtons]::Left)) {
+        $script:GraphPanCandidate = $false
+        $script:GraphPanning = $false
+        $graphCanvas.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
+})
+
+$graphCanvas.add_KeyDown({ param($sender, $eventArgs)
+    $navigationKeys = @([System.Windows.Forms.Keys]::Left, [System.Windows.Forms.Keys]::Right, [System.Windows.Forms.Keys]::Up, [System.Windows.Forms.Keys]::Down)
+    if (-not $script:GraphLayout -or $eventArgs.KeyCode -notin $navigationKeys) { return }
+    $current = if ($script:GraphSelectedOccurrenceId -and $script:GraphLayout.NodeById.ContainsKey($script:GraphSelectedOccurrenceId)) { $script:GraphLayout.NodeById[$script:GraphSelectedOccurrenceId] } else { @($script:GraphLayout.Nodes | Select-Object -First 1)[0] }
+    if ($null -eq $current) { return }
+    $candidate = $null
+    if ($eventArgs.KeyCode -in @([System.Windows.Forms.Keys]::Left, [System.Windows.Forms.Keys]::Right)) {
+        $sameLane = @($script:GraphLayout.Nodes | Where-Object { $_.StageId -eq $current.StageId } | Sort-Object { $_.Rectangle.Left })
+        $index = [Array]::IndexOf($sameLane, $current)
+        $nextIndex = if ($eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::Left) { [Math]::Max(0, $index - 1) } else { [Math]::Min($sameLane.Count - 1, $index + 1) }
+        $candidate = $sameLane[$nextIndex]
+    } else {
+        $laneIndex = -1
+        for ($index = 0; $index -lt $script:GraphLayout.Lanes.Count; $index++) {
+            if ($script:GraphLayout.Lanes[$index].Stage.Id -eq $current.StageId) { $laneIndex = $index; break }
+        }
+        $targetLaneIndex = if ($eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::Up) { $laneIndex - 1 } else { $laneIndex + 1 }
+        if ($targetLaneIndex -ge 0 -and $targetLaneIndex -lt $script:GraphLayout.Lanes.Count) {
+            $targetStageId = [string]$script:GraphLayout.Lanes[$targetLaneIndex].Stage.Id
+            $centerX = $current.Rectangle.Left + $current.Rectangle.Width / 2
+            $candidate = @($script:GraphLayout.Nodes | Where-Object { $_.StageId -eq $targetStageId } | Sort-Object { [Math]::Abs(($_.Rectangle.Left + $_.Rectangle.Width / 2) - $centerX) } | Select-Object -First 1)[0]
+        }
+    }
+    if ($null -ne $candidate) {
+        Select-DependencyGraphNode -Node $candidate
+        $graphScroll.AutoScrollPosition = [System.Drawing.Point]::new([Math]::Max(0, $candidate.Rectangle.Left - 30), [Math]::Max(0, $candidate.Rectangle.Top - 30))
+    }
+    $eventArgs.Handled = $true
+})
+
 $list.add_SelectedIndexChanged({
     if ($list.SelectedItems.Count -eq 0) {
         $script:UpdatingCreationToggle = $true; $creationToggle.CheckState = 'Unchecked'; $script:UpdatingCreationToggle = $false
@@ -2807,16 +3811,7 @@ $list.add_SelectedIndexChanged({
     $selectedLabel.Text = if ($records.Count -eq 1) { $records[0].Name } else { "$($records.Count) mods selected" }
     if ($records.Count -eq 1) {
         $record = $records[0]
-        $pathLabel.Text = $record.Path
-        Set-NexusLink -Url $record.Facts.ModSite
-        $targetBox.SelectedIndex = 0
-        if ($null -ne $record.Target) {
-            for ($index = 1; $index -lt $targetBox.Items.Count; $index++) {
-                if ([int]$targetBox.Items[$index].Stage -eq [int]$record.Target) { $targetBox.SelectedIndex = $index; break }
-            }
-        }
-        $shownOrder = if ($creationEditToggle.Checked) { if ($record.InCreation) { (Get-RecordCreationOrder $record) + 1 } else { 'Not in Creation' } } elseif ($null -ne $record.Target) { (Get-RecordQueueOrder $record) + 1 } else { 'Unassigned' }
-        $dependencyBox.Text = "Creation queue: $(if($record.InCreation){'Yes'}else{'No'})`r`nMod version: $(if($record.Facts.ModVersion){$record.Facts.ModVersion}else{'Unknown'})`r`nMount ID: $(if($record.Facts.MountIds.Count){$record.Facts.MountIds -join ', '}else{'None'})`r`nQueue order: $shownOrder`r`n`r`nStatus:`r`n$($record.Status)`r`n`r`nProvides:`r`n$(if($record.Facts.Provided.Count){$record.Facts.Provided -join "`r`n"}else{'None'})`r`n`r`nRequired dependencies:`r`n$(if($record.Facts.Required.Count){$record.Facts.Required -join "`r`n"}else{'None'})`r`n`r`nOptional or patch detection:`r`n$(if($record.Facts.Conditional.Count){$record.Facts.Conditional -join "`r`n"}else{'None'})`r`n`r`nIncompatible DLC:`r`n$(if($record.Facts.Incompatible.Count){$record.Facts.Incompatible -join "`r`n"}else{'None'})`r`n`r`nLocal organizer rules:`r`n$(Get-LocalRuleDetailsText $record)`r`n`r`nDescription:`r`n$(if($record.Facts.Description){$record.Facts.Description}else{'No description available.'})"
+        Show-ModRecordDetails -Record $record
     } else {
         $pathLabel.Text = ''; $targetBox.SelectedIndex = 0
         $manageRulesButton.Enabled = $false
@@ -2840,7 +3835,7 @@ $list.add_ItemCheck({ param($sender, $eventArgs)
     $item.SubItems[8].Text = $record.Status
     $item.BackColor = if ($record.Status -like 'Catalog v*' -or $record.Status -eq 'Metadata unavailable') { [System.Drawing.Color]::LightYellow } elseif ($include) { [System.Drawing.Color]::Honeydew } elseif ($record.DeveloperOnly) { [System.Drawing.Color]::AliceBlue } else { [System.Drawing.Color]::White }
     $assigned = @($script:State.AsiRecords.Values | Where-Object { $_.Memberships.Count -gt 0 }).Count
-    $summaryLabel.Text = "$($list.Items.Count) visible | $assigned/$($script:State.AsiRecords.Count) used"
+    Set-SummaryText "$($list.Items.Count) visible | $assigned/$($script:State.AsiRecords.Count) used"
 })
 
 $asiSelectAllButton.add_Click({
@@ -2966,6 +3961,194 @@ function Remove-MissingModsFromAll {
     Refresh-List
 }
 
+function Get-SafeInstalledModDeleteTarget {
+    param($Record)
+
+    if ($null -eq $Record -or $Record.Game -notin @('LE1', 'LE2', 'LE3') -or -not $Record.Facts.Exists) {
+        throw 'Only installed LE1, LE2, or LE3 mods can be deleted.'
+    }
+    $relativePath = ([string]$Record.Path).Trim()
+    $parts = @([regex]::Split($relativePath, '[\\/]') | Where-Object { $_ -ne '' })
+    if ($parts.Count -ne 3 -or $parts[0] -ine [string]$Record.Game -or $parts[1] -in @('.', '..') -or $parts[2] -ine 'moddesc.ini') {
+        throw "The mod path is not a direct ME3Tweaks mod folder: $relativePath"
+    }
+    if ($parts[1].IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+        throw "The mod folder name is invalid: $($parts[1])"
+    }
+
+    $gameRootCandidate = Join-Path $ModsRoot ([string]$Record.Game)
+    $modDescCandidate = Join-Path $ModsRoot $relativePath
+    if (-not (Test-Path -LiteralPath $gameRootCandidate -PathType Container) -or -not (Test-Path -LiteralPath $modDescCandidate -PathType Leaf)) {
+        throw "The installed mod is no longer present: $($Record.Name)"
+    }
+    $gameRoot = (Resolve-Path -LiteralPath $gameRootCandidate).Path.TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $modDescPath = (Resolve-Path -LiteralPath $modDescCandidate).Path
+    $modDirectory = Split-Path $modDescPath -Parent
+    $parentDirectory = Split-Path $modDirectory -Parent
+    if ($parentDirectory -ine $gameRoot -or (Split-Path $modDescPath -Leaf) -ine 'moddesc.ini') {
+        throw "Refusing to delete a path outside the direct $($Record.Game) mod directory: $relativePath"
+    }
+    $directoryInfo = Get-Item -LiteralPath $modDirectory -Force
+    if (($directoryInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to delete a linked or redirected mod directory: $modDirectory"
+    }
+    return [pscustomobject]@{
+        Record = $Record
+        Game = [string]$Record.Game
+        Name = [string]$Record.Name
+        RelativePath = $relativePath
+        Key = "$($Record.Game)|$($relativePath.ToLowerInvariant())"
+        SourceDirectory = $directoryInfo.FullName
+        FolderName = $directoryInfo.Name
+    }
+}
+
+function Get-OrganizerModDeletionQueueChanges {
+    param([System.Collections.Generic.HashSet[string]]$SelectedKeys)
+
+    $changes = [System.Collections.Generic.List[object]]::new()
+    if (-not (Test-Path -LiteralPath $script:OrganizerQueueStoreRoot -PathType Container)) { return @() }
+    foreach ($file in @(Get-ChildItem -LiteralPath $script:OrganizerQueueStoreRoot -Filter '*.biq2' -File -Recurse)) {
+        try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { throw "Organizer queue could not be read: $($file.FullName)`r`n$($_.Exception.Message)" }
+        if ($data.organizerManaged -ne $true) { continue }
+        $game = ([string]$data.game).ToUpperInvariant()
+        if ($game -notin @('LE1', 'LE2', 'LE3')) { continue }
+        $preview = Get-QueueModsAfterOrganizerDeletion -QueueData $data -Game $game -SelectedKeys $SelectedKeys
+        if ($preview.RemovedCount -le 0) { continue }
+        $changes.Add([pscustomobject]@{
+            Path = $file.FullName
+            Data = $data
+            Remaining = @($preview.Remaining)
+            RemovedCount = [int]$preview.RemovedCount
+            QueueName = $(if ([string]::IsNullOrWhiteSpace([string]$data.queuename)) { $file.BaseName } else { [string]$data.queuename })
+        })
+    }
+    return @($changes)
+}
+
+function Remove-SelectedInstalledMods {
+    if (-not $script:State -or $asiEditToggle.Checked -or [string]$viewBox.SelectedItem -eq 'Dependency Graph') { return }
+    $records = @($list.SelectedItems | ForEach-Object { $_.Tag } | Where-Object { $null -ne $_ })
+    if (-not $records.Count) { return }
+    if ($script:State.Dirty) {
+        [System.Windows.Forms.MessageBox]::Show('Save or reload the current queue changes before deleting installed mods.', 'Unsaved queue changes', 'OK', 'Information')
+        return
+    }
+
+    try {
+        $targetsByPath = [ordered]@{}
+        foreach ($record in $records) {
+            $target = Get-SafeInstalledModDeleteTarget -Record $record
+            if (-not $targetsByPath.Contains($target.SourceDirectory.ToLowerInvariant())) { $targetsByPath[$target.SourceDirectory.ToLowerInvariant()] = $target }
+        }
+        $targets = @($targetsByPath.Values)
+        if (-not $targets.Count) { return }
+
+        $selectedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($target in $targets) { [void]$selectedKeys.Add($target.Key) }
+        $queueChanges = @(Get-OrganizerModDeletionQueueChanges -SelectedKeys $selectedKeys)
+        $queueReferenceCount = [int](($queueChanges | Measure-Object -Property RemovedCount -Sum).Sum)
+        $modsRootPath = [System.IO.Path]::GetFullPath($ModsRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+        $deletedModsRootPath = [System.IO.Path]::GetFullPath($script:DeletedModsRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+        if ($deletedModsRootPath -eq $modsRootPath -or $deletedModsRootPath.StartsWith($modsRootPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The recovery archive must be outside the ME3Tweaks mods directory.'
+        }
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $archiveSessionRoot = Get-UniqueOrganizerArchivePath -ArchiveRoot $script:DeletedModsRoot -FileName $stamp
+
+        $shownNames = @($targets | Select-Object -First 12 | ForEach-Object { "  - $($_.Name) [$($_.Game)]" })
+        if ($targets.Count -gt 12) { $shownNames += "  - ...and $($targets.Count - 12) more" }
+        $message = @(
+            "Delete $($targets.Count) installed mod(s) from ME3Tweaks?"
+            ''
+            ($shownNames -join "`r`n")
+            ''
+            "The mod folders will be removed from ME3Tweaks and $queueReferenceCount reference(s) will be removed from $($queueChanges.Count) Organizer-managed queue(s) across all sets and Creation Lists."
+            ''
+            'Queues created directly in ME3Tweaks will not be changed.'
+            'Affected Organizer queues will be backed up first.'
+            ''
+            "For recovery, the deleted mod folders will be kept here:`r`n$archiveSessionRoot"
+        ) -join "`r`n"
+        $answer = [System.Windows.Forms.MessageBox]::Show($message, 'Delete installed mods', 'YesNo', 'Warning')
+        if ($answer -ne 'Yes') { return }
+
+        [void](New-Item -ItemType Directory -Path $archiveSessionRoot -Force)
+        $queueBackupRoot = if ($queueChanges.Count) { Join-Path $script:BackupRoot "$stamp-before-delete-mods" } else { '' }
+        $queueBackups = [System.Collections.Generic.List[object]]::new()
+        $movedMods = [System.Collections.Generic.List[object]]::new()
+        $modifiedQueues = [System.Collections.Generic.List[object]]::new()
+        try {
+            if ($queueChanges.Count) {
+                [void](New-Item -ItemType Directory -Path $queueBackupRoot -Force)
+                $storeRootPrefix = [System.IO.Path]::GetFullPath($script:OrganizerQueueStoreRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+                foreach ($change in $queueChanges) {
+                    $sourcePath = [System.IO.Path]::GetFullPath($change.Path)
+                    if (-not $sourcePath.StartsWith($storeRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Queue path escaped Organizer storage: $sourcePath" }
+                    $relativeQueuePath = $sourcePath.Substring($storeRootPrefix.Length)
+                    $backupPath = Join-Path $queueBackupRoot $relativeQueuePath
+                    [void](New-Item -ItemType Directory -Path (Split-Path $backupPath -Parent) -Force)
+                    Copy-Item -LiteralPath $sourcePath -Destination $backupPath -Force
+                    $queueBackups.Add([pscustomobject]@{ Source = $sourcePath; Backup = $backupPath })
+                }
+            }
+
+            foreach ($target in $targets) {
+                $gameArchiveRoot = Join-Path $archiveSessionRoot $target.Game
+                $destination = Get-UniqueOrganizerArchivePath -ArchiveRoot $gameArchiveRoot -FileName $target.FolderName
+                Move-Item -LiteralPath $target.SourceDirectory -Destination $destination
+                $movedMods.Add([pscustomobject]@{ Source = $target.SourceDirectory; Destination = $destination; Name = $target.Name; Game = $target.Game })
+            }
+
+            foreach ($change in $queueChanges) {
+                $change.Data | Add-Member -NotePropertyName mods -NotePropertyValue @($change.Remaining) -Force
+                $json = $change.Data | ConvertTo-Json -Depth 30
+                [System.IO.File]::WriteAllText($change.Path, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+                $modifiedQueues.Add($change)
+            }
+            Sync-ActiveOrganizerQueues
+
+            $manifest = [pscustomobject][ordered]@{
+                deletedUtc = [DateTime]::UtcNow.ToString('o')
+                mods = @($movedMods | ForEach-Object { [pscustomobject]@{ game = $_.Game; name = $_.Name; originalPath = $_.Source; archivedPath = $_.Destination } })
+                organizerQueueReferencesRemoved = $queueReferenceCount
+                organizerQueuesChanged = @($queueChanges | ForEach-Object { [pscustomobject]@{ name = $_.QueueName; path = $_.Path; referencesRemoved = $_.RemovedCount } })
+                queueBackupPath = $queueBackupRoot
+                legacyME3TweaksQueuesChanged = $false
+            }
+            [System.IO.File]::WriteAllText((Join-Path $archiveSessionRoot 'DeletionManifest.json'), (($manifest | ConvertTo-Json -Depth 20) + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+        } catch {
+            $operationError = $_
+            foreach ($backup in $queueBackups) {
+                if (Test-Path -LiteralPath $backup.Backup -PathType Leaf) { Copy-Item -LiteralPath $backup.Backup -Destination $backup.Source -Force }
+            }
+            for ($movedIndex = $movedMods.Count - 1; $movedIndex -ge 0; $movedIndex--) {
+                $moved = $movedMods[$movedIndex]
+                if ((Test-Path -LiteralPath $moved.Destination -PathType Container) -and -not (Test-Path -LiteralPath $moved.Source)) {
+                    Move-Item -LiteralPath $moved.Destination -Destination $moved.Source
+                }
+            }
+            try { Sync-ActiveOrganizerQueues } catch {}
+            throw $operationError
+        }
+
+        $viewedSetId = [string]$script:State.SetId
+        $viewedGame = [string]$script:State.Game
+        $script:State = if ($viewedGame -eq 'All') { Get-AllGameState -SetId $viewedSetId } else { Get-GameState -Game $viewedGame -SetId $viewedSetId }
+        Refresh-QueueSelectors
+        Refresh-List
+        $backupText = if ($queueBackupRoot) { "`r`nQueue backup: $queueBackupRoot" } else { '' }
+        [System.Windows.Forms.MessageBox]::Show(
+            "$($targets.Count) mod(s) were removed from ME3Tweaks and archived for recovery.`r`n$queueReferenceCount Organizer queue reference(s) were removed.`r`n`r`nArchive: $archiveSessionRoot$backupText",
+            'Mods deleted',
+            'OK',
+            'Information'
+        )
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("The selected mods could not be deleted safely.`r`n`r`n$($_.Exception.Message)", 'Delete mods failed', 'OK', 'Error')
+    }
+}
+
 $assignButton.add_Click({
     if ($list.SelectedItems.Count -eq 0) { return }
     if ($script:State.Game -eq 'All') { Remove-MissingModsFromAll; return }
@@ -2981,6 +4164,7 @@ $renameQueueButton.add_Click({ Rename-FilteredQueue })
 $manageRulesButton.add_Click({ Show-LocalRuleManager })
 $deleteQueueButton.add_Click({ Remove-FilteredQueue })
 $backupButton.add_Click({ Show-BackupManager })
+$deleteModsButton.add_Click({ Remove-SelectedInstalledMods })
 $moveUpButton.add_Click({ Move-SelectedMods -Direction Up })
 $moveDownButton.add_Click({ Move-SelectedMods -Direction Down })
 $mountOrderButton.add_Click({ Set-QueueOrderByMountId })
@@ -3002,6 +4186,40 @@ $searchBox.add_TextChanged({ Refresh-List })
 $filterBox.add_SelectedIndexChanged({ if ($script:State -and -not $script:UpdatingAsiMode) { Refresh-List } })
 $queueFilterBox.add_SelectedIndexChanged({ if ($script:State) { Update-ModeControls; Refresh-List; Update-MoveButtons; Update-RestoreBeforeInstallToggle } })
 $sortBox.add_SelectedIndexChanged({ if ($script:State) { Refresh-List } })
+$viewBox.add_SelectedIndexChanged({
+    if ($script:State -and -not $script:UpdatingViewMode) {
+        $script:PreferredViewMode = [string]$viewBox.SelectedItem
+        Set-OrganizerViewMode
+    }
+})
+$graphOrderingToggle.add_CheckedChanged({ if ($script:GraphLayout) { $graphCanvas.Invalidate() } })
+$graphConflictToggle.add_CheckedChanged({ if ($script:GraphLayout) { $graphCanvas.Invalidate() } })
+$graphIntegratedToggle.add_CheckedChanged({ if ($script:GraphLayout) { $graphCanvas.Invalidate() } })
+$graphFocusBox.add_SelectedIndexChanged({ if ($script:GraphLayout) { $graphCanvas.Invalidate() } })
+$graphUnassignedToggle.add_CheckedChanged({ if ($script:State -and [string]$viewBox.SelectedItem -eq 'Dependency Graph') { Refresh-DependencyGraph } })
+$setGraphZoom = {
+    param([double]$Value)
+    $script:GraphZoom = [Math]::Max(0.5, [Math]::Min(2.5, $Value))
+    if ($script:State -and [string]$viewBox.SelectedItem -eq 'Dependency Graph') { Refresh-DependencyGraph }
+}
+$graphZoomOutButton.add_Click({ & $setGraphZoom ($script:GraphZoom - 0.1) })
+$graphZoomInButton.add_Click({ & $setGraphZoom ($script:GraphZoom + 0.1) })
+$graphFitButton.add_Click({
+    if (-not $script:GraphLayout) { return }
+    $currentWidth = [Math]::Max(1, $graphCanvas.Width)
+    $availableWidth = [Math]::Max(1, $graphScroll.ClientSize.Width - 20)
+    & $setGraphZoom ($script:GraphZoom * $availableWidth / $currentWidth)
+})
+$graphCanvas.add_MouseWheel({ param($sender, $eventArgs)
+    if ([System.Windows.Forms.Control]::ModifierKeys -eq [System.Windows.Forms.Keys]::Control) {
+        & $setGraphZoom ($script:GraphZoom + $(if ($eventArgs.Delta -gt 0) { 0.1 } else { -0.1 }))
+    } elseif (([System.Windows.Forms.Control]::ModifierKeys -band [System.Windows.Forms.Keys]::Shift) -eq [System.Windows.Forms.Keys]::Shift) {
+        $currentX = -$graphScroll.AutoScrollPosition.X
+        $currentY = -$graphScroll.AutoScrollPosition.Y
+        $graphScroll.AutoScrollPosition = [System.Drawing.Point]::new([Math]::Max(0, $currentX - [int]($eventArgs.Delta / 2)), $currentY)
+    }
+})
+$graphScroll.add_Resize({ if ($graphHost.Visible -and $script:State) { Refresh-DependencyGraph } })
 $reloadButton.add_Click({ [void](Load-SelectedGame) })
 $gameBox.add_SelectedIndexChanged({ if ($form.Visible) { [void](Load-SelectedGame) } })
 $saveButton.add_Click({
@@ -3042,11 +4260,22 @@ $form.add_Shown({
         }
     }
     if ($script:WindowSettings -and $script:WindowSettings.Maximized -eq $true) { $form.WindowState = 'Maximized' }
+    if (-not $UiSmokeTest -and $script:QueueMigrationSummary -and ($script:QueueMigrationSummary.Queues -gt 0 -or $script:QueueMigrationSummary.Duplicates -gt 0 -or $script:QueueMigrationSummary.Backups -gt 0)) {
+        $migrationText = "Organizer storage cleanup completed.`r`n`r`nQueue files moved beside the Organizer: $($script:QueueMigrationSummary.Queues)`r`nBackup groups moved: $($script:QueueMigrationSummary.Backups)`r`nDuplicate Organizer queue copies archived: $($script:QueueMigrationSummary.Duplicates)`r`n`r`nOnly the active Organizer set is now published to ME3Tweaks. Queues created directly in ME3Tweaks were left untouched."
+        if ($script:QueueMigrationSummary.Archive) { $migrationText += "`r`n`r`nDuplicate archive:`r`n$($script:QueueMigrationSummary.Archive)" }
+        [System.Windows.Forms.MessageBox]::Show($migrationText, 'Organizer storage cleanup', 'OK', 'Information')
+    }
 })
 
 $gameBox.SelectedIndex = 0
 $filterBox.SelectedIndex = 0
 $sortBox.SelectedIndex = 0
+$viewBox.SelectedIndex = 0
+$graphFocusBox.SelectedItem = if ($script:WindowSettings -and [string]$script:WindowSettings.GraphFocusMode -in @('All relationships', 'Selected mod', 'Problems only')) { [string]$script:WindowSettings.GraphFocusMode } else { 'All relationships' }
+$graphOrderingToggle.Checked = -not ($script:WindowSettings -and $script:WindowSettings.PSObject.Properties['GraphShowOrdering'] -and $script:WindowSettings.GraphShowOrdering -eq $false)
+$graphConflictToggle.Checked = -not ($script:WindowSettings -and $script:WindowSettings.PSObject.Properties['GraphShowConflicts'] -and $script:WindowSettings.GraphShowConflicts -eq $false)
+$graphIntegratedToggle.Checked = -not ($script:WindowSettings -and $script:WindowSettings.PSObject.Properties['GraphShowIntegrated'] -and $script:WindowSettings.GraphShowIntegrated -eq $false)
+$graphUnassignedToggle.Checked = $script:WindowSettings -and $script:WindowSettings.GraphShowUnassigned -eq $true
 $initialSetId = Get-ActiveSetId
 $script:State = Get-AllGameState -SetId $initialSetId
 Refresh-SetSelector -PreferredSetId $initialSetId
@@ -3068,6 +4297,66 @@ if ($missingGames.Count) {
 }
 Refresh-QueueSelectors
 Refresh-List
+$script:UiSmokeTestFailure = ''
+if ($UiSmokeTest) {
+    $form.add_Shown({
+        try {
+            $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+            $form.Size = [System.Drawing.Size]::new(1400, 820)
+            [System.Windows.Forms.Application]::DoEvents()
+            Update-TopBarSummaryLayout
+            if ($top.Height -ne 106 -or $summaryLabel.Top -ne 84 -or $summaryLabel.Width -lt 180) { throw 'Narrow top-bar summary layout failed.' }
+            $form.Size = [System.Drawing.Size]::new(1700, 820)
+            [System.Windows.Forms.Application]::DoEvents()
+            Update-TopBarSummaryLayout
+            if ($top.Height -ne 82 -or $summaryLabel.Top -ne 14 -or $summaryLabel.Width -lt 180 -or $summaryToolTip.GetToolTip($summaryLabel) -ne $summaryLabel.Text) { throw 'Wide top-bar summary layout or tooltip failed.' }
+            $panTest = Get-GraphPanScrollPosition -StartScroll ([System.Drawing.Point]::new(200, 150)) -StartScreen ([System.Drawing.Point]::new(100, 100)) -CurrentScreen ([System.Drawing.Point]::new(125, 130))
+            $panClampTest = Get-GraphPanScrollPosition -StartScroll ([System.Drawing.Point]::new(10, 10)) -StartScreen ([System.Drawing.Point]::new(100, 100)) -CurrentScreen ([System.Drawing.Point]::new(150, 150))
+            if ($panTest.X -ne 175 -or $panTest.Y -ne 120 -or $panClampTest.X -ne 0 -or $panClampTest.Y -ne 0) { throw 'Dependency Graph drag-to-pan calculation failed.' }
+            foreach ($testGame in @('LE1', 'LE2', 'LE3')) {
+                $gameBox.SelectedItem = $testGame
+                [System.Windows.Forms.Application]::DoEvents()
+                $viewBox.SelectedItem = 'Dependency Graph'
+                [System.Windows.Forms.Application]::DoEvents()
+                if (-not $graphHost.Visible -or $list.Visible) { throw "Graph/List visibility switch failed for $testGame." }
+                if ($deleteModsButton.Enabled) { throw "Installed-mod deletion was enabled in read-only Graph View for $testGame." }
+                if ($null -eq $script:GraphLayout -or $script:GraphLayout.Nodes.Count -lt 1 -or $script:GraphLayout.Edges.Count -lt 1) { throw "Graph layout did not contain nodes and edges for $testGame." }
+            }
+            $assignedNodeCount = $script:GraphLayout.Nodes.Count
+            $graphUnassignedToggle.Checked = $true
+            [System.Windows.Forms.Application]::DoEvents()
+            if ($script:GraphLayout.Nodes.Count -le $assignedNodeCount -or -not @($script:GraphLayout.Lanes | Where-Object { $_.Stage.Kind -eq 'Unassigned' }).Count) { throw 'Show unassigned did not add its graph lane and nodes.' }
+            $graphUnassignedToggle.Checked = $false
+            $viewBox.SelectedItem = 'List'
+            [System.Windows.Forms.Application]::DoEvents()
+            if (-not $list.Visible -or $graphHost.Visible) { throw 'Returning from Graph View to List View failed.' }
+            $viewBox.SelectedItem = 'Dependency Graph'
+            [System.Windows.Forms.Application]::DoEvents()
+            $deleteTestRecord = @($script:State.Records.Values | Where-Object { $_.Facts.Exists -and ($_.InCreation -or $null -ne $_.Target) } | Select-Object -First 1)[0]
+            if ($null -eq $deleteTestRecord) { throw 'No installed assigned mod was available for the deletion safety smoke test.' }
+            $deleteTarget = Get-SafeInstalledModDeleteTarget -Record $deleteTestRecord
+            if (-not (Test-Path -LiteralPath $deleteTarget.SourceDirectory -PathType Container)) { throw 'Installed-mod deletion resolved an invalid source directory.' }
+            $deleteTestKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            [void]$deleteTestKeys.Add($deleteTarget.Key)
+            $deleteQueueChanges = @(Get-OrganizerModDeletionQueueChanges -SelectedKeys $deleteTestKeys)
+            if (-not $deleteQueueChanges.Count -or (($deleteQueueChanges | Measure-Object -Property RemovedCount -Sum).Sum -lt 1)) { throw 'Installed-mod deletion did not find its Organizer queue reference.' }
+            $preview = [System.Drawing.Bitmap]::new([Math]::Min(1200, $graphCanvas.Width), [Math]::Min(700, $graphCanvas.Height))
+            try {
+                $graphCanvas.DrawToBitmap($preview, [System.Drawing.Rectangle]::new(0, 0, $preview.Width, $preview.Height))
+                if (-not [string]::IsNullOrWhiteSpace($UiSmokeScreenshot)) { $preview.Save($UiSmokeScreenshot, [System.Drawing.Imaging.ImageFormat]::Png) }
+            } finally { $preview.Dispose() }
+            $testNode = @($script:GraphLayout.Nodes | Where-Object { $null -ne $_.Record } | Select-Object -First 1)[0]
+            $script:GraphSelectedOccurrenceId = [string]$testNode.Id
+            Show-ModRecordDetails -Record $testNode.Record -OccurrenceText 'UI smoke test occurrence'
+            $graphCanvas.Invalidate()
+            [System.Windows.Forms.Application]::DoEvents()
+        } catch {
+            $script:UiSmokeTestFailure = $_.Exception.Message
+        } finally {
+            $form.BeginInvoke([Action]{ $form.Close() }) | Out-Null
+        }
+    })
+}
 try {
     [void]$form.ShowDialog()
 } finally {
@@ -3078,9 +4367,22 @@ try {
         Maximized = $form.WindowState -eq 'Maximized'
         DetailsWidth = $split.Panel2.Width
         ColumnWidths = @($list.Columns | ForEach-Object { $_.Width })
+        ViewMode = [string]$script:PreferredViewMode
+        GraphZoom = [double]$script:GraphZoom
+        GraphFocusMode = [string]$graphFocusBox.SelectedItem
+        GraphShowOrdering = [bool]$graphOrderingToggle.Checked
+        GraphShowConflicts = [bool]$graphConflictToggle.Checked
+        GraphShowIntegrated = [bool]$graphIntegratedToggle.Checked
+        GraphShowUnassigned = [bool]$graphUnassignedToggle.Checked
     }
-    [System.IO.File]::WriteAllText($script:SettingsPath, (($settings | ConvertTo-Json) + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+    if (-not $UiSmokeTest) { [System.IO.File]::WriteAllText($script:SettingsPath, (($settings | ConvertTo-Json) + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false)) }
+    $summaryToolTip.Dispose()
+    $graphToolTip.Dispose()
     $form.Dispose()
     [System.Windows.Forms.Application]::ExitThread()
+}
+if ($UiSmokeTest) {
+    if ($script:UiSmokeTestFailure) { throw "Dependency Graph UI smoke test failed: $($script:UiSmokeTestFailure)" }
+    Write-Output 'Dependency Graph UI smoke test: OK'
 }
 exit 0

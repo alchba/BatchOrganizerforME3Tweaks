@@ -1,12 +1,10 @@
 # ME3Tweaks Batch Queue Organizer
 
-Current version: **1.0.3**
-
-The planned graphical queue and dependency view is reserved for version **1.1.0**.
+Current version: **1.1.0**
 
 ME3Tweaks Batch Queue Organizer is an independent Windows companion utility for organizing ME3Tweaks Batch Installer queues for Mass Effect Legendary Edition.
 
-It provides one interface for LE1, LE2, and LE3 working queues, global queue sets, separate Creation Lists, ASI plugin assignments, install order, dependency checks, declared incompatibilities, missing-mod cleanup, and backups.
+It provides one interface for LE1, LE2, and LE3 working queues, global queue sets, separate Creation Lists, ASI plugin assignments, install order, dependency checks, declared incompatibilities, a read-only Dependency Graph View, missing-mod cleanup, recoverable installed-mod deletion, and backups.
 
 The Organizer does not install game mods itself. It creates and manages Batch Installer queue files that are used through [ME3Tweaks Mod Manager](https://me3tweaks.com/modmanager).
 
@@ -19,6 +17,7 @@ Nexus Mods page: [ME3Tweaks Batch Queue Organizer](https://www.nexusmods.com/mas
 - separate editable Creation Lists
 - per-queue ASI plugin selection
 - queue creation, deletion, and safe renaming with automatic backups
+- read-only Dependency Graph View with queue lanes, relationship lines, zoom, focus filters, and left-mouse drag panning
 - queue ordering by buttons, drag and drop, Mount ID baseline, or dependency-aware auto-sort
 - safe auto-sort for one filtered queue plus an explicitly warned advanced mode across all working queues in a set
 - requirement, compatibility-target, and declared-incompatibility checks
@@ -26,9 +25,10 @@ Nexus Mods page: [ME3Tweaks Batch Queue Organizer](https://www.nexusmods.com/mas
 - optional subject- or target-version conditions for local rules
 - direct Nexus links read from each mod's `modsite` metadata
 - missing-mod cleanup across Organizer-managed sets
+- recoverable deletion of installed mods, including removal from every Organizer-managed queue while foreign ME3Tweaks queues remain untouched
 - restore-before-install settings
 - automatic timestamped backups and a Backup Manager
-- portable settings stored next to the application
+- canonical queue sets, backups, migration archives, deleted-mod recovery data, and portable settings stored next to the application
 
 ## Repository Layout
 
@@ -44,7 +44,7 @@ Build-BatchQueueOrganizerDistribution.ps1
     Optional local script for creating the self-contained single-file EXE.
 ```
 
-Generated `Organizer*.json` files are user-specific application data and are intentionally excluded from source control. Compiled binaries, `bin`, `obj`, publish directories, and distribution archives are also ignored.
+Generated `Organizer*.json` files and the `OrganizerQueueSets`, `OrganizerBackups`, `OrganizerMigrationArchive`, and `OrganizerDeletedMods` directories are user-specific application data and are intentionally excluded from source control. Compiled binaries, `bin`, `obj`, publish directories, and distribution archives are also ignored.
 
 ## Run From Source
 
@@ -92,8 +92,11 @@ Most of the file size is the bundled .NET runtime, not the Organizer source. A f
 
 - Only Organizer-managed queues are edited or deleted.
 - Queues created directly in ME3Tweaks Mod Manager are treated as foreign and remain untouched.
+- Canonical Organizer queues and backups live beside the application. Only Creation Lists and the globally active set are projected into ME3Tweaks `mods\BatchModQueues`; older Organizer subfolders are migrated out automatically.
 - Queue files are backed up before changes are written, renamed, or deleted.
+- Installed mods are deleted only after an explicit confirmation. Their folders are moved to `OrganizerDeletedMods`, affected Organizer queue references are removed across every set, and foreign ME3Tweaks queues are not changed.
 - Creation Lists remain separate from global sets.
+- Dependency Graph View is intentionally read-only and cannot reassign or reorder mods.
 - Normal auto-sort changes only the currently filtered working queue. Advanced auto-sort may move mods between every working queue in the selected game and set, while preserving each queue's mod count and leaving the Creation List untouched.
 - Dependencies and local load-order rules take priority during auto-sort. Mount ID and mod name provide the baseline where no dependency dictates the order; unresolved or cyclic cases remain marked for manual review.
 - Validation uses metadata declared by installed mods plus optional user-defined local rules. It cannot identify conflicts that are absent from both sources.
