@@ -6,7 +6,9 @@
 - Added shared dependency modeling so List View validation, dependency-aware sorting, and Graph View use the same known relationships.
 - Moved canonical Organizer queue sets and backups out of the ME3Tweaks directory and beside the application.
 - Added automatic migration and duplicate cleanup for older Organizer queue folders while preserving queues created directly in ME3Tweaks.
-- Changed ME3Tweaks publishing so only Creation Lists and the globally active Organizer set are visible in the Batch Installer.
+- Changed ME3Tweaks publishing so exactly one Organizer target is visible in the Batch Installer: either the three Creation Lists or the globally active working-queue set.
+- Added **Creation Lists** to the independent **Active in ME3Tweaks** selector; visibility no longer affects which lists can be viewed or edited.
+- Changed published queue filenames to match their visible queue names, preventing ME3Tweaks from displaying a second copy after saving current install-group choices and keeping the saved group in the same sort position. Newer choices saved by ME3Tweaks are imported into the canonical Organizer queue on the next launch instead of being overwritten; the previous canonical queue is backed up first.
 - Added recoverable deletion of installed mods with confirmation, queue backups, removal from every Organizer-managed queue, and rollback protection. Foreign ME3Tweaks queues remain untouched.
 - Improved the adaptive top toolbar layout and summary tooltip for narrower windows.
 - Expanded storage-isolation, queue-filtering, graph-layout, drag-panning, and UI regression tests.

@@ -14,7 +14,7 @@ Nexus Mods page: [ME3Tweaks Batch Queue Organizer](https://www.nexusmods.com/mas
 
 - LE1, LE2, and LE3 queue management
 - global queue sets with independent ME3Tweaks activation
-- separate editable Creation Lists
+- separate editable Creation Lists with their own exclusive ME3Tweaks activation target
 - per-queue ASI plugin selection
 - queue creation, deletion, and safe renaming with automatic backups
 - read-only Dependency Graph View with queue lanes, relationship lines, zoom, focus filters, and left-mouse drag panning
@@ -29,6 +29,7 @@ Nexus Mods page: [ME3Tweaks Batch Queue Organizer](https://www.nexusmods.com/mas
 - restore-before-install settings
 - automatic timestamped backups and a Backup Manager
 - canonical queue sets, backups, migration archives, deleted-mod recovery data, and portable settings stored next to the application
+- ME3Tweaks-facing queue filenames matched to their visible names so saved install-group choices reuse the existing published projection instead of creating a duplicate; newer ME3Tweaks-saved choices are imported into the canonical Organizer queue on the next launch after an automatic backup
 
 ## Repository Layout
 
@@ -92,10 +93,10 @@ Most of the file size is the bundled .NET runtime, not the Organizer source. A f
 
 - Only Organizer-managed queues are edited or deleted.
 - Queues created directly in ME3Tweaks Mod Manager are treated as foreign and remain untouched.
-- Canonical Organizer queues and backups live beside the application. Only Creation Lists and the globally active set are projected into ME3Tweaks `mods\BatchModQueues`; older Organizer subfolders are migrated out automatically.
+- Canonical Organizer queues and backups live beside the application. `Active in ME3Tweaks` projects exactly one Organizer target into `mods\BatchModQueues`: either the three Creation Lists or one global set's working queues. Older Organizer subfolders are migrated out automatically.
 - Queue files are backed up before changes are written, renamed, or deleted.
 - Installed mods are deleted only after an explicit confirmation. Their folders are moved to `OrganizerDeletedMods`, affected Organizer queue references are removed across every set, and foreign ME3Tweaks queues are not changed.
-- Creation Lists remain separate from global sets.
+- Creation Lists remain separate from global sets and can be viewed or edited regardless of which activation target is published to ME3Tweaks.
 - Dependency Graph View is intentionally read-only and cannot reassign or reorder mods.
 - Normal auto-sort changes only the currently filtered working queue. Advanced auto-sort may move mods between every working queue in the selected game and set, while preserving each queue's mod count and leaving the Creation List untouched.
 - Dependencies and local load-order rules take priority during auto-sort. Mount ID and mod name provide the baseline where no dependency dictates the order; unresolved or cyclic cases remain marked for manual review.

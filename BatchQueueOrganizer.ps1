@@ -78,9 +78,10 @@ foreach ($queue in @($script:QueueRegistry | Where-Object { [int]$_.Order -gt 0 
     }
 }
 if ($canonicalSetIdByLegacyId.ContainsKey($activeSetIdFromLegacyRegistry)) { $activeSetIdFromLegacyRegistry = [string]$canonicalSetIdByLegacyId[$activeSetIdFromLegacyRegistry] }
-if (-not $globalSetsById.Contains($activeSetIdFromLegacyRegistry)) { $activeSetIdFromLegacyRegistry = 'default' }
+if ($activeSetIdFromLegacyRegistry -ne 'creation' -and -not $globalSetsById.Contains($activeSetIdFromLegacyRegistry)) { $activeSetIdFromLegacyRegistry = 'default' }
 foreach ($set in $globalSetsById.Values) { $set.Active = $set.Id -eq $activeSetIdFromLegacyRegistry }
 $script:SetRegistry = @($globalSetsById.Values)
+$script:SetRegistry += [pscustomobject][ordered]@{ Id = 'creation'; Name = 'Creation Lists'; Active = $activeSetIdFromLegacyRegistry -eq 'creation' }
 $script:RemovedMissingMods = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 if (Test-Path -LiteralPath $script:RemovedMissingModsPath) {
     try { foreach ($entry in @(Get-Content -LiteralPath $script:RemovedMissingModsPath -Raw -Encoding UTF8 | ConvertFrom-Json)) { [void]$script:RemovedMissingMods.Add([string]$entry) } } catch { }
@@ -119,7 +120,7 @@ function Set-SetRegistryEntry {
 }
 
 function Get-OrganizerSets {
-    $sets = @($script:SetRegistry)
+    $sets = @($script:SetRegistry | Where-Object { $_.Id -ne 'creation' })
     if (-not @($sets | Where-Object { $_.Id -eq 'default' }).Count) {
         $sets += [pscustomobject][ordered]@{ Id = 'default'; Name = 'Default'; Active = $false }
     }
@@ -131,11 +132,16 @@ function Get-ActiveSetId {
     return $(if ($active.Count) { [string]$active[0].Id } else { 'default' })
 }
 
+function Get-ActiveOrganizerTargetId {
+    $active = @($script:SetRegistry | Where-Object { $_.Active -eq $true } | Select-Object -First 1)
+    return $(if ($active.Count) { [string]$active[0].Id } else { 'default' })
+}
+
 function Set-ActiveSetRegistryEntry {
     param([string]$SetId)
     foreach ($set in @($script:SetRegistry)) { $set.Active = $set.Id -eq $SetId }
     if (-not @($script:SetRegistry | Where-Object { $_.Id -eq $SetId }).Count) {
-        Set-SetRegistryEntry -SetId $SetId -Name $SetId
+        Set-SetRegistryEntry -SetId $SetId -Name $(if ($SetId -eq 'creation') { 'Creation Lists' } else { $SetId })
         @($script:SetRegistry | Where-Object { $_.Id -eq $SetId })[0].Active = $true
     }
     Save-SetRegistry
@@ -364,6 +370,29 @@ function Get-OrganizerQueueStorePath {
     return Join-Path (Get-OrganizerQueueStoreDirectory -Game ([string]$Entry.Game) -SetId $setId) $fileName
 }
 
+function Get-OrganizerQueueProjectionFileName {
+    param($Entry)
+    $fallback = [string]$Entry.FileName
+    $queueName = [string]$Entry.QueueName
+    if ([string]::IsNullOrWhiteSpace($queueName)) { return $fallback }
+    if ($queueName -in @('.', '..') -or $queueName.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0) { return $fallback }
+    if ($queueName.TrimEnd(' ', '.') -ne $queueName) { return $fallback }
+    if ($queueName -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') { return $fallback }
+    return "$queueName.biq2"
+}
+
+function Test-ShouldImportME3TweaksSavedProjection {
+    param($Projection, $Canonical, $Identity)
+    if ($null -eq $Projection -or $null -eq $Canonical -or $null -eq $Identity) { return $false }
+    if (-not $Canonical.IsInternal -or $Projection.IsInternal -or -not $Projection.IsTopLevel) { return $false }
+    if ($Projection.Identity.OrganizerManaged -eq $true -or $Projection.Identity.Key -ne $Identity.Key) { return $false }
+    if ($Projection.File.Name -ine (Get-OrganizerQueueProjectionFileName -Entry $Identity)) { return $false }
+    if ($Projection.File.LastWriteTimeUtc -lt $Canonical.File.LastWriteTimeUtc) { return $false }
+    if ($null -eq $Projection.Data.PSObject.Properties['mods'] -or $null -eq $Projection.Data.PSObject.Properties['asimods']) { return $false }
+    if ([string]$Projection.Data.game -ine [string]$Identity.Game -or [string]$Projection.Data.queuename -ine [string]$Identity.QueueName) { return $false }
+    return $true
+}
+
 function Get-OrganizerQueueIdentity {
     param([System.IO.FileInfo]$File, $Data)
     if ($null -eq $File -or $null -eq $Data) { return $null }
@@ -422,14 +451,24 @@ function Get-UniqueOrganizerArchivePath {
     return $candidate
 }
 
+function Test-OrganizerQueueShouldBePublished {
+    param($Entry, [string]$ActiveTargetId = (Get-ActiveOrganizerTargetId))
+    if ($null -eq $Entry) { return $false }
+    if ($ActiveTargetId -eq 'creation') { return [int]$Entry.Order -eq 0 }
+    return [int]$Entry.Order -gt 0 -and [string]$Entry.SetId -eq $ActiveTargetId
+}
+
 function Sync-ActiveOrganizerQueues {
-    param([string]$ActiveSetId = (Get-ActiveSetId))
+    param([string]$ActiveSetId = (Get-ActiveOrganizerTargetId))
     [void](New-Item -ItemType Directory -Path $script:QueueRoot -Force)
-    $publishedEntries = @($script:QueueRegistry | Where-Object { [int]$_.Order -eq 0 -or $_.SetId -eq $ActiveSetId })
+    $publishedEntries = @($script:QueueRegistry | Where-Object { Test-OrganizerQueueShouldBePublished -Entry $_ -ActiveTargetId $ActiveSetId })
     $sources = @{}
     foreach ($entry in $publishedEntries) {
         $source = Get-OrganizerQueueStorePath -Entry $entry
-        if (Test-Path -LiteralPath $source -PathType Leaf) { $sources[[string]$entry.FileName] = $source }
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
+        $projectionFileName = Get-OrganizerQueueProjectionFileName -Entry $entry
+        if ($sources.ContainsKey($projectionFileName)) { $projectionFileName = [string]$entry.FileName }
+        $sources[$projectionFileName] = $source
     }
     foreach ($file in @(Get-ChildItem -LiteralPath $script:QueueRoot -Filter '*.biq2' -File)) {
         try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
@@ -452,6 +491,8 @@ function Initialize-OrganizerQueueStorage {
     $migratedQueues = 0
     $archivedDuplicates = 0
     $migratedBackups = 0
+    $importedConfigurations = 0
+    $importBackupRoot = ''
 
     $legacyBackupRoot = Join-Path $script:QueueRoot 'OrganizerBackups'
     if (Test-Path -LiteralPath $legacyBackupRoot -PathType Container) {
@@ -500,12 +541,26 @@ function Initialize-OrganizerQueueStorage {
         if (-not $ordered.Count) { continue }
         $winner = $ordered[0]
         $identity = $winner.Identity
+        $projectionFileName = Get-OrganizerQueueProjectionFileName -Entry $identity
+        $savedProjection = @($group.Group | Where-Object {
+            Test-ShouldImportME3TweaksSavedProjection -Projection $_ -Canonical $winner -Identity $identity
+        } | Sort-Object { $_.File.LastWriteTimeUtc } -Descending | Select-Object -First 1)
+        if ($savedProjection.Count) {
+            if ([string]::IsNullOrWhiteSpace($importBackupRoot)) {
+                $importBackupRoot = Join-Path $script:BackupRoot "$stamp-before-ME3Tweaks-config-import"
+                [void](New-Item -ItemType Directory -Path $importBackupRoot -Force)
+            }
+            $canonicalBackupPath = Get-UniqueOrganizerArchivePath -ArchiveRoot $importBackupRoot -FileName $winner.File.Name
+            Copy-Item -LiteralPath $winner.File.FullName -Destination $canonicalBackupPath
+            $winner.Data = $savedProjection[0].Data
+            $importedConfigurations++
+        }
         $targetDirectory = Get-OrganizerQueueStoreDirectory -Game $identity.Game -SetId $identity.SetId
         [void](New-Item -ItemType Directory -Path $targetDirectory -Force)
         $targetPath = Join-Path $targetDirectory $identity.FileName
         foreach ($candidate in $ordered) {
             if ($candidate.File.FullName -ieq $winner.File.FullName) { continue }
-            $publishedProjection = $winner.IsInternal -and $candidate.IsTopLevel -and $candidate.File.Name -ieq $identity.FileName
+            $publishedProjection = $winner.IsInternal -and $candidate.IsTopLevel -and ($candidate.File.Name -ieq $projectionFileName -or $candidate.File.Name -ieq $identity.FileName)
             if ($publishedProjection) {
                 $winnerHash = (Get-FileHash -LiteralPath $winner.File.FullName -Algorithm SHA256).Hash
                 $candidateHash = (Get-FileHash -LiteralPath $candidate.File.FullName -Algorithm SHA256).Hash
@@ -544,7 +599,14 @@ function Initialize-OrganizerQueueStorage {
         if (-not @(Get-ChildItem -LiteralPath $script:LegacyInactiveQueueRoot -Force).Count) { Remove-Item -LiteralPath $script:LegacyInactiveQueueRoot }
     }
     Sync-ActiveOrganizerQueues
-    $script:QueueMigrationSummary = [pscustomobject]@{ Queues = $migratedQueues; Duplicates = $archivedDuplicates; Backups = $migratedBackups; Archive = $(if ($archivedDuplicates) { $archiveSessionRoot } else { '' }) }
+    $script:QueueMigrationSummary = [pscustomobject]@{
+        Queues = $migratedQueues
+        Duplicates = $archivedDuplicates
+        Backups = $migratedBackups
+        ImportedConfigurations = $importedConfigurations
+        ImportBackup = $importBackupRoot
+        Archive = $(if ($archivedDuplicates) { $archiveSessionRoot } else { '' })
+    }
     $script:QueueStorageInitialized = $true
 }
 
@@ -1646,19 +1708,20 @@ function Test-OrganizerQueueStorageIsolation {
     if ($deletedModsRootPath -eq $modsRootPath -or $deletedModsRootPath.StartsWith($modsRootPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Deleted-mod storage is still inside the ME3Tweaks mods tree.' }
     if (Test-Path -LiteralPath (Join-Path $script:QueueRoot 'OrganizerQueueSets')) { throw 'Legacy OrganizerQueueSets remained inside ME3Tweaks.' }
     if (Test-Path -LiteralPath (Join-Path $script:QueueRoot 'OrganizerBackups')) { throw 'Legacy OrganizerBackups remained inside ME3Tweaks.' }
-    $activeSetId = Get-ActiveSetId
+    $activeSetId = Get-ActiveOrganizerTargetId
     $publishedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($file in @(Get-ChildItem -LiteralPath $script:QueueRoot -Filter '*.biq2' -File)) {
         try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
         $identity = Get-OrganizerQueueIdentity -File $file -Data $data
         if ($null -eq $identity) { continue }
-        if ([int]$identity.Order -gt 0 -and $identity.SetId -ne $activeSetId) { throw "Inactive Organizer queue is published in ME3Tweaks: $($file.Name)" }
+        if (-not (Test-OrganizerQueueShouldBePublished -Entry $identity -ActiveTargetId $activeSetId)) { throw "Inactive Organizer queue is published in ME3Tweaks: $($file.Name)" }
+        if ($file.Name -ine (Get-OrganizerQueueProjectionFileName -Entry $identity)) { throw "Organizer queue uses a non-projection file name in ME3Tweaks: $($file.Name)" }
         if (-not $publishedKeys.Add($identity.Key)) { throw "Duplicate Organizer queue is published in ME3Tweaks: $($identity.Key)" }
     }
     foreach ($entry in @($script:QueueRegistry)) {
         $storePath = Get-OrganizerQueueStorePath -Entry $entry
         if (-not (Test-Path -LiteralPath $storePath -PathType Leaf)) { continue }
-        if ([int]$entry.Order -eq 0 -or $entry.SetId -eq $activeSetId) {
+        if (Test-OrganizerQueueShouldBePublished -Entry $entry -ActiveTargetId $activeSetId) {
             $expectedKey = "$($entry.Game)|$(if([int]$entry.Order -eq 0){'creation'}else{$entry.SetId})|$([int]$entry.Order)"
             if (-not $publishedKeys.Contains($expectedKey)) { throw "Active Organizer queue was not published to ME3Tweaks: $($entry.FileName)" }
         }
@@ -1666,6 +1729,36 @@ function Test-OrganizerQueueStorageIsolation {
 }
 
 function Invoke-SelfTest {
+    $importIdentity = [pscustomobject]@{ Game = 'LE1'; QueueName = 'LE1 [Default] 1 - Base Mods'; FileName = 'LE1.default.1 - Base Mods.biq2'; Key = 'LE1|default|1' }
+    $importCanonical = [pscustomobject]@{ IsInternal = $true; File = [pscustomobject]@{ Name = $importIdentity.FileName; LastWriteTimeUtc = [datetime]'2026-01-01T10:00:00Z' } }
+    $importProjection = [pscustomobject]@{
+        IsInternal = $false; IsTopLevel = $true
+        File = [pscustomobject]@{ Name = 'LE1 [Default] 1 - Base Mods.biq2'; LastWriteTimeUtc = [datetime]'2026-01-01T10:01:00Z' }
+        Identity = [pscustomobject]@{ Key = $importIdentity.Key; OrganizerManaged = $false }
+        Data = [pscustomobject]@{ game = 'LE1'; queuename = $importIdentity.QueueName; mods = @(); asimods = @() }
+    }
+    if (-not (Test-ShouldImportME3TweaksSavedProjection -Projection $importProjection -Canonical $importCanonical -Identity $importIdentity)) { throw 'ME3Tweaks saved configuration import regression test failed.' }
+    $importProjection.File.LastWriteTimeUtc = [datetime]'2026-01-01T09:59:00Z'
+    if (Test-ShouldImportME3TweaksSavedProjection -Projection $importProjection -Canonical $importCanonical -Identity $importIdentity) { throw 'Stale ME3Tweaks configuration import regression test failed.' }
+    $importProjection.File.LastWriteTimeUtc = [datetime]'2026-01-01T10:01:00Z'
+    $importProjection.Identity.OrganizerManaged = $true
+    if (Test-ShouldImportME3TweaksSavedProjection -Projection $importProjection -Canonical $importCanonical -Identity $importIdentity) { throw 'Organizer projection was mistaken for a ME3Tweaks saved configuration.' }
+    $projectionNameTest = [pscustomobject]@{ QueueName = 'LE1 [Default] 1 - Base Mods'; FileName = 'LE1.default.1 - Base Mods.biq2' }
+    $projectionFallbackTest = [pscustomobject]@{ QueueName = 'Invalid/Queue'; FileName = 'LE1.default.1 - Base Mods.biq2' }
+    if ((Get-OrganizerQueueProjectionFileName -Entry $projectionNameTest) -ne 'LE1 [Default] 1 - Base Mods.biq2' -or
+        (Get-OrganizerQueueProjectionFileName -Entry $projectionFallbackTest) -ne $projectionFallbackTest.FileName) {
+        throw 'ME3Tweaks projection file-name regression test failed.'
+    }
+    $creationProjection = [pscustomobject]@{ Order = 0; SetId = 'creation' }
+    $defaultProjection = [pscustomobject]@{ Order = 1; SetId = 'default' }
+    $alternateProjection = [pscustomobject]@{ Order = 1; SetId = 'alternate' }
+    if (-not (Test-OrganizerQueueShouldBePublished -Entry $creationProjection -ActiveTargetId 'creation') -or
+        (Test-OrganizerQueueShouldBePublished -Entry $defaultProjection -ActiveTargetId 'creation') -or
+        (Test-OrganizerQueueShouldBePublished -Entry $creationProjection -ActiveTargetId 'default') -or
+        -not (Test-OrganizerQueueShouldBePublished -Entry $defaultProjection -ActiveTargetId 'default') -or
+        (Test-OrganizerQueueShouldBePublished -Entry $alternateProjection -ActiveTargetId 'default')) {
+        throw 'Exclusive Creation List/set activation regression test failed.'
+    }
     $testMemberships = [System.Collections.Generic.List[int]]::new()
     $testAsiRecord = [pscustomobject]@{ Memberships = $testMemberships; VersionsByStage = @{}; CatalogVersion = 13; Status = '' }
     Set-AsiRecordQueueMembership -Record $testAsiRecord -Stage 1 -Include $true -UseCatalogVersion $true
@@ -1924,6 +2017,9 @@ function Invoke-SelfTest {
     Write-Output 'ASI membership add/remove: OK'
     Write-Output 'ASI queue round-trip: OK'
     Write-Output 'Organizer mod deletion queue filtering: OK'
+    Write-Output 'Exclusive Creation List/set activation: OK'
+    Write-Output 'ME3Tweaks projection file names: OK'
+    Write-Output 'ME3Tweaks saved configuration import: OK'
     Write-Output 'Local rule resolution/status: OK'
     Write-Output 'Local rule JSON round-trip: OK'
     Write-Output 'Version conditions/integrated rules: OK'
@@ -2676,6 +2772,7 @@ function Refresh-SetSelector {
     $setBox.Items.Clear()
     $activeSetBox.Items.Clear()
     $sets = @(Get-OrganizerSets)
+    [void]$activeSetBox.Items.Add([pscustomobject]@{ Text = 'Creation Lists'; Id = 'creation'; Name = 'Creation Lists' })
     foreach ($set in $sets) {
         [void]$setBox.Items.Add([pscustomobject]@{ Text = [string]$set.Name; Id = [string]$set.Id; Name = [string]$set.Name })
         [void]$activeSetBox.Items.Add([pscustomobject]@{ Text = [string]$set.Name; Id = [string]$set.Id; Name = [string]$set.Name })
@@ -2683,11 +2780,13 @@ function Refresh-SetSelector {
     $setBox.DisplayMember = 'Text'
     $activeSetBox.DisplayMember = 'Text'
     $wantedId = if ($PreferredSetId) { $PreferredSetId } elseif ($script:State -and $script:State.SetId) { [string]$script:State.SetId } else { Get-ActiveSetId }
-    $activeId = Get-ActiveSetId
+    $activeId = Get-ActiveOrganizerTargetId
     $setBox.SelectedIndex = 0
     $activeSetBox.SelectedIndex = 0
     for ($index = 0; $index -lt $setBox.Items.Count; $index++) {
         if ($setBox.Items[$index].Id -eq $wantedId) { $setBox.SelectedIndex = $index }
+    }
+    for ($index = 0; $index -lt $activeSetBox.Items.Count; $index++) {
         if ($activeSetBox.Items[$index].Id -eq $activeId) { $activeSetBox.SelectedIndex = $index }
     }
     $setBox.Enabled = -not ($creationEditToggle.Checked -and [string]$gameBox.SelectedItem -ne 'All')
@@ -2937,7 +3036,7 @@ function Load-SelectedSet {
 function Load-ActiveSet {
     if ($script:UpdatingActiveSetBox -or -not $form.Visible -or $activeSetBox.SelectedIndex -lt 0) { return }
     $newActiveId = [string]$activeSetBox.SelectedItem.Id
-    $oldActiveId = Get-ActiveSetId
+    $oldActiveId = Get-ActiveOrganizerTargetId
     if ($newActiveId -eq $oldActiveId) { return }
     if ($script:State -and $script:State.Dirty) {
         [System.Windows.Forms.MessageBox]::Show('Save or reload current changes before changing the set shown in ME3Tweaks.', 'ME3Tweaks Organizer', 'OK', 'Warning')
@@ -2945,8 +3044,13 @@ function Load-ActiveSet {
         return
     }
     $newName = [string]$activeSetBox.SelectedItem.Name
+    $activationDescription = if ($newActiveId -eq 'creation') {
+        'Show only the Organizer-managed Creation Lists in ME3Tweaks for all three games?'
+    } else {
+        "Show only the Organizer-managed working queues from '$newName' in ME3Tweaks for all three games?"
+    }
     $answer = [System.Windows.Forms.MessageBox]::Show(
-        "Show only organizer queues from '$newName' in ME3Tweaks for all three games?`r`n`r`nThe set currently viewed in this tool will not change. Creation Lists and queues created directly in ME3Tweaks are not affected.",
+        "$activationDescription`r`n`r`nThe set currently viewed in this tool will not change. Other Organizer-managed queues will be hidden. Queues created directly in ME3Tweaks are not affected.",
         'Change active ME3Tweaks set',
         'YesNo',
         'Question'
@@ -2987,7 +3091,8 @@ function New-ManagedQueueFile {
     }
     [System.IO.File]::WriteAllText($path, (($queue | ConvertTo-Json -Depth 20) + [Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
     Set-QueueRegistryEntry -Game $Game -SetId $SetId -SetName $SetName -Order $Order -Name $Name -QueueName $queueName -FileName (Split-Path $path -Leaf)
-    if ($Order -eq 0 -or $SetId -eq (Get-ActiveSetId)) { Sync-ActiveOrganizerQueues }
+    $newQueueIdentity = [pscustomobject]@{ Order = $Order; SetId = $(if ($Order -eq 0) { 'creation' } else { $SetId }) }
+    if (Test-OrganizerQueueShouldBePublished -Entry $newQueueIdentity) { Sync-ActiveOrganizerQueues }
     return $path
 }
 
@@ -3096,7 +3201,7 @@ function Remove-OrganizerSet {
     $entries = @($script:QueueRegistry | Where-Object { $_.SetId -eq $setId -and [int]$_.Order -gt 0 })
     $answer = [System.Windows.Forms.MessageBox]::Show("Delete global set '$setName' and its $($entries.Count) queue(s) across LE1, LE2 and LE3?`r`n`r`nThe global Creation Lists are not affected. A backup will be created first.", 'Confirm set deletion', 'YesNo', 'Warning')
     if ($answer -ne 'Yes') { return }
-    if ((Get-ActiveSetId) -eq $setId) { Set-ActiveOrganizerSet -SetId 'default' }
+    if ((Get-ActiveOrganizerTargetId) -eq $setId) { Set-ActiveOrganizerSet -SetId 'default' }
     $backupRoot = Join-Path $script:BackupRoot ("{0}-delete-global-set-{1}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $setId)
     [void](New-Item -ItemType Directory -Path $backupRoot -Force)
     foreach ($entry in $entries) {
@@ -4260,10 +4365,11 @@ $form.add_Shown({
         }
     }
     if ($script:WindowSettings -and $script:WindowSettings.Maximized -eq $true) { $form.WindowState = 'Maximized' }
-    if (-not $UiSmokeTest -and $script:QueueMigrationSummary -and ($script:QueueMigrationSummary.Queues -gt 0 -or $script:QueueMigrationSummary.Duplicates -gt 0 -or $script:QueueMigrationSummary.Backups -gt 0)) {
-        $migrationText = "Organizer storage cleanup completed.`r`n`r`nQueue files moved beside the Organizer: $($script:QueueMigrationSummary.Queues)`r`nBackup groups moved: $($script:QueueMigrationSummary.Backups)`r`nDuplicate Organizer queue copies archived: $($script:QueueMigrationSummary.Duplicates)`r`n`r`nOnly the active Organizer set is now published to ME3Tweaks. Queues created directly in ME3Tweaks were left untouched."
+    if (-not $UiSmokeTest -and $script:QueueMigrationSummary -and ($script:QueueMigrationSummary.Queues -gt 0 -or $script:QueueMigrationSummary.Duplicates -gt 0 -or $script:QueueMigrationSummary.Backups -gt 0 -or $script:QueueMigrationSummary.ImportedConfigurations -gt 0)) {
+        $migrationText = "Organizer storage synchronization completed.`r`n`r`nQueue files moved beside the Organizer: $($script:QueueMigrationSummary.Queues)`r`nBackup groups moved: $($script:QueueMigrationSummary.Backups)`r`nDuplicate Organizer queue copies archived: $($script:QueueMigrationSummary.Duplicates)`r`nME3Tweaks saved configurations imported: $($script:QueueMigrationSummary.ImportedConfigurations)`r`n`r`nOnly the selected Organizer activation target is now published to ME3Tweaks. Queues created directly in ME3Tweaks were left untouched."
+        if ($script:QueueMigrationSummary.ImportBackup) { $migrationText += "`r`n`r`nCanonical backup before import:`r`n$($script:QueueMigrationSummary.ImportBackup)" }
         if ($script:QueueMigrationSummary.Archive) { $migrationText += "`r`n`r`nDuplicate archive:`r`n$($script:QueueMigrationSummary.Archive)" }
-        [System.Windows.Forms.MessageBox]::Show($migrationText, 'Organizer storage cleanup', 'OK', 'Information')
+        [System.Windows.Forms.MessageBox]::Show($migrationText, 'Organizer storage synchronization', 'OK', 'Information')
     }
 })
 
@@ -4310,6 +4416,8 @@ if ($UiSmokeTest) {
             [System.Windows.Forms.Application]::DoEvents()
             Update-TopBarSummaryLayout
             if ($top.Height -ne 82 -or $summaryLabel.Top -ne 14 -or $summaryLabel.Width -lt 180 -or $summaryToolTip.GetToolTip($summaryLabel) -ne $summaryLabel.Text) { throw 'Wide top-bar summary layout or tooltip failed.' }
+            $activationIds = @($activeSetBox.Items | ForEach-Object { [string]$_.Id })
+            if ('creation' -notin $activationIds -or [string]$activeSetBox.SelectedItem.Id -ne (Get-ActiveOrganizerTargetId)) { throw 'Creation List activation target selector failed.' }
             $panTest = Get-GraphPanScrollPosition -StartScroll ([System.Drawing.Point]::new(200, 150)) -StartScreen ([System.Drawing.Point]::new(100, 100)) -CurrentScreen ([System.Drawing.Point]::new(125, 130))
             $panClampTest = Get-GraphPanScrollPosition -StartScroll ([System.Drawing.Point]::new(10, 10)) -StartScreen ([System.Drawing.Point]::new(100, 100)) -CurrentScreen ([System.Drawing.Point]::new(150, 150))
             if ($panTest.X -ne 175 -or $panTest.Y -ne 120 -or $panClampTest.X -ne 0 -or $panClampTest.Y -ne 0) { throw 'Dependency Graph drag-to-pan calculation failed.' }
