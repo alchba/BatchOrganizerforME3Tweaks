@@ -29,6 +29,8 @@ Pushing a tag beginning with `v` starts the **Create Windows release** GitHub Ac
 
 The release stays a draft so its files, notes, version number, and links can be reviewed before it becomes public. This deliberately leaves publication under the author’s control.
 
+Alternatively, open **Actions**, choose **Create Windows release**, then use **Run workflow**. Enter the intended version tag, such as `v1.1.1`. This creates the same draft release from the selected branch without requiring a tag to be pushed first.
+
 The full Organizer self-test intentionally remains a local release check because it needs a valid ME3Tweaks Mod Manager folder with installed mod metadata. GitHub Actions has no safe access to a user's mod installation.
 
 ## After the workflow finishes
