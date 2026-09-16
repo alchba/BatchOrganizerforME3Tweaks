@@ -3,23 +3,23 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net9.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
-    <AssemblyName>ME3TweaksBatchQueueOrganizer</AssemblyName>
+    <AssemblyName>BatchQueueOrganizer</AssemblyName>
     <RootNamespace>ME3TweaksBatchQueueOrganizer</RootNamespace>
     <Version>1.1.0</Version>
     <AssemblyVersion>1.1.0.0</AssemblyVersion>
     <FileVersion>1.1.0.0</FileVersion>
     <InformationalVersion>1.1.0</InformationalVersion>
-    <Product>ME3Tweaks Batch Queue Organizer</Product>
-    <AssemblyTitle>ME3Tweaks Batch Queue Organizer</AssemblyTitle>
+    <Product>Batch Queue Organizer for ME3Tweaks</Product>
+    <AssemblyTitle>Batch Queue Organizer for ME3Tweaks</AssemblyTitle>
     <Description>Portable organizer for ME3Tweaks Batch Installer queues</Description>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <ApplicationIcon>ME3TweaksBatchQueueOrganizer.ico</ApplicationIcon>
+    <ApplicationIcon>..\..\assets\BatchQueueOrganizer.ico</ApplicationIcon>
     <DefineConstants Condition="'$(EmbedOrganizerAssets)' == 'true'">$(DefineConstants);DISTRIBUTION_BUILD</DefineConstants>
   </PropertyGroup>
   <ItemGroup Condition="'$(EmbedOrganizerAssets)' == 'true'">
-    <EmbeddedResource Include="..\BatchQueueOrganizer.ps1" LogicalName="BatchQueueOrganizer.ps1" />
-    <EmbeddedResource Include="ME3TweaksBatchQueueOrganizer.ico" LogicalName="ME3TweaksBatchQueueOrganizer.ico" />
+    <EmbeddedResource Include="..\..\BatchQueueOrganizer.ps1" LogicalName="BatchQueueOrganizer.ps1" />
+    <EmbeddedResource Include="..\..\assets\BatchQueueOrganizer.ico" LogicalName="BatchQueueOrganizer.ico" />
   </ItemGroup>
 </Project>

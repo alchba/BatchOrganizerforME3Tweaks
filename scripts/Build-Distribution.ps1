@@ -2,15 +2,15 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
-$projectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
-$projectFile = Join-Path $projectRoot 'BatchQueueOrganizerLauncher\BatchQueueOrganizerLauncher.csproj'
-$publishRoot = Join-Path $projectRoot 'BatchQueueOrganizerLauncher\distribution-publish'
+$projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$projectFile = Join-Path $projectRoot 'src\BatchQueueOrganizerLauncher\BatchQueueOrganizerLauncher.csproj'
+$publishRoot = Join-Path $projectRoot 'src\BatchQueueOrganizerLauncher\distribution-publish'
 $distributionRoot = Join-Path $projectRoot 'distribute'
-$distributionExe = Join-Path $distributionRoot 'ME3TweaksBatchQueueOrganizer.exe'
+$distributionExe = Join-Path $distributionRoot 'BatchQueueOrganizer.exe'
 
 if (Test-Path -LiteralPath $publishRoot) {
     $resolvedPublishRoot = [System.IO.Path]::GetFullPath($publishRoot)
-    $expectedParent = [System.IO.Path]::GetFullPath((Join-Path $projectRoot 'BatchQueueOrganizerLauncher'))
+    $expectedParent = [System.IO.Path]::GetFullPath((Join-Path $projectRoot 'src\BatchQueueOrganizerLauncher'))
     if ((Split-Path $resolvedPublishRoot -Parent) -ne $expectedParent) { throw "Unsafe publish path: $resolvedPublishRoot" }
     Remove-Item -LiteralPath $resolvedPublishRoot -Recurse -Force
 }
@@ -31,7 +31,7 @@ dotnet publish $projectFile `
 
 if ($LASTEXITCODE -ne 0) { throw "Distribution build failed with exit code $LASTEXITCODE." }
 
-$publishedExe = Join-Path $publishRoot 'ME3TweaksBatchQueueOrganizer.exe'
+$publishedExe = Join-Path $publishRoot 'BatchQueueOrganizer.exe'
 if (-not (Test-Path -LiteralPath $publishedExe)) { throw "Published executable was not found: $publishedExe" }
 Copy-Item -LiteralPath $publishedExe -Destination $distributionExe -Force
 Remove-Item -LiteralPath $publishRoot -Recurse -Force

@@ -5,3 +5,4 @@
 *.manifest text eol=crlf
 *.md text eol=lf
 *.ico binary
+*.pdf binary

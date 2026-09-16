@@ -1,0 +1,66 @@
+name: Create Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-draft-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install .NET 9 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Build the self-contained Organizer
+        shell: pwsh
+        run: ./scripts/Build-Distribution.ps1
+
+      - name: Validate PowerShell source
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./BatchQueueOrganizer.ps1), [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            throw "PowerShell syntax validation failed."
+          }
+
+      - name: Create release archives
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $releaseRoot = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
+          $packageRoot = Join-Path $releaseRoot 'BatchQueueOrganizer'
+          New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+
+          Copy-Item distribute\BatchQueueOrganizer.exe $packageRoot
+          Copy-Item docs\Readme.txt $packageRoot
+          Copy-Item docs\Batch_Queue_Organizer_User_Guide.pdf $packageRoot
+
+          $binaryArchive = Join-Path $releaseRoot "BatchQueueOrganizer-$tag.zip"
+          Compress-Archive -Path "$packageRoot\*" -DestinationPath $binaryArchive -CompressionLevel Optimal
+
+          $sourceArchive = Join-Path $releaseRoot "BatchQueueOrganizer-Source-$tag.zip"
+          git archive --format=zip --prefix="BatchQueueOrganizer-Source/" --output=$sourceArchive $env:GITHUB_SHA
+
+      - name: Create GitHub draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            release-assets/BatchQueueOrganizer-*.zip

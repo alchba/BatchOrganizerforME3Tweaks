@@ -2080,7 +2080,7 @@ if (-not $script:QueueRoot) {
     }
     while (-not $script:QueueRoot) {
         if ($picker.ShowDialog() -ne 'OK') {
-            [System.Windows.Forms.MessageBox]::Show('The organizer needs the location of ME3TweaksModManager.exe to find the data and mods folders.', 'ME3Tweaks Batch Queue Organizer', 'OK', 'Information')
+            [System.Windows.Forms.MessageBox]::Show('The organizer needs the location of ME3TweaksModManager.exe to find the data and mods folders.', 'Batch Queue Organizer for ME3Tweaks', 'OK', 'Information')
             exit 0
         }
         $candidateRoot = Split-Path $picker.FileName -Parent
@@ -2098,14 +2098,14 @@ if (-not $script:QueueRoot) {
 Initialize-OrganizerQueueStorage
 
 $form = [System.Windows.Forms.Form]@{
-    Text = "ME3Tweaks Batch Queue Organizer v$($script:AppVersion)"
+    Text = "Batch Queue Organizer for ME3Tweaks v$($script:AppVersion)"
     Width = 1400
     Height = 820
     StartPosition = 'CenterScreen'
     MinimumSize = [System.Drawing.Size]::new(1050, 650)
 }
 if ($UiSmokeTest) { $form.Opacity = 0; $form.ShowInTaskbar = $false }
-$iconPath = Join-Path $PSScriptRoot 'ME3TweaksBatchQueueOrganizer.ico'
+$iconPath = Join-Path $PSScriptRoot 'BatchQueueOrganizer.ico'
 if (Test-Path -LiteralPath $iconPath) { $form.Icon = [System.Drawing.Icon]::new($iconPath) }
 $script:GraphZoom = if ($script:WindowSettings -and [double]$script:WindowSettings.GraphZoom -ge 0.5 -and [double]$script:WindowSettings.GraphZoom -le 2.5) { [double]$script:WindowSettings.GraphZoom } else { 1.0 }
 $script:GraphSelectedOccurrenceId = ''

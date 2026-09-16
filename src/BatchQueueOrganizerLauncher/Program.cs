@@ -17,9 +17,9 @@ internal static class Program
         runtimeDirectory = Path.Combine(Path.GetTempPath(), $"ME3TweaksBatchQueueOrganizer-{Environment.ProcessId}");
         Directory.CreateDirectory(runtimeDirectory);
         string scriptPath = Path.Combine(runtimeDirectory, "BatchQueueOrganizer.ps1");
-        string iconPath = Path.Combine(runtimeDirectory, "ME3TweaksBatchQueueOrganizer.ico");
+        string iconPath = Path.Combine(runtimeDirectory, "BatchQueueOrganizer.ico");
         ExtractResource("BatchQueueOrganizer.ps1", scriptPath);
-        ExtractResource("ME3TweaksBatchQueueOrganizer.ico", iconPath);
+        ExtractResource("BatchQueueOrganizer.ico", iconPath);
 #else
         string scriptPath = Path.Combine(appDirectory, "BatchQueueOrganizer.ps1");
 
@@ -27,7 +27,7 @@ internal static class Program
         {
             MessageBox.Show(
                 $"BatchQueueOrganizer.ps1 was not found next to the application.\n\nExpected path:\n{scriptPath}",
-                "ME3Tweaks Batch Queue Organizer",
+                "Batch Queue Organizer for ME3Tweaks",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
             return 2;
@@ -69,7 +69,7 @@ internal static class Program
                 string details = string.IsNullOrWhiteSpace(errorTask.Result) ? outputTask.Result : errorTask.Result;
                 MessageBox.Show(
                     string.IsNullOrWhiteSpace(details) ? $"The organizer closed with error code {childProcess.ExitCode}." : details.Trim(),
-                    "ME3Tweaks Batch Queue Organizer",
+                    "Batch Queue Organizer for ME3Tweaks",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
             }
@@ -79,7 +79,7 @@ internal static class Program
         {
             MessageBox.Show(
                 exception.Message,
-                "ME3Tweaks Batch Queue Organizer",
+                "Batch Queue Organizer for ME3Tweaks",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
             return 1;

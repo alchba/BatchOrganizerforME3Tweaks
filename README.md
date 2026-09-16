@@ -1,14 +1,14 @@
-# ME3Tweaks Batch Queue Organizer
+# Batch Queue Organizer for ME3Tweaks
 
 Current version: **1.1.0**
 
-ME3Tweaks Batch Queue Organizer is an independent Windows companion utility for organizing ME3Tweaks Batch Installer queues for Mass Effect Legendary Edition.
+Batch Queue Organizer for ME3Tweaks is an independent Windows companion utility for organizing ME3Tweaks Batch Installer queues for Mass Effect Legendary Edition.
 
 It provides one interface for LE1, LE2, and LE3 working queues, global queue sets, separate Creation Lists, ASI plugin assignments, install order, dependency checks, declared incompatibilities, a read-only Dependency Graph View, missing-mod cleanup, recoverable installed-mod deletion, and backups.
 
 The Organizer does not install game mods itself. It creates and manages Batch Installer queue files that are used through [ME3Tweaks Mod Manager](https://me3tweaks.com/modmanager).
 
-Nexus Mods page: [ME3Tweaks Batch Queue Organizer](https://www.nexusmods.com/masseffectlegendaryedition/mods/3399)
+Nexus Mods page: [Batch Queue Organizer for ME3Tweaks](https://www.nexusmods.com/masseffectlegendaryedition/mods/3399)
 
 ## Features
 
@@ -37,12 +37,21 @@ Nexus Mods page: [ME3Tweaks Batch Queue Organizer](https://www.nexusmods.com/mas
 BatchQueueOrganizer.ps1
     Main application and Windows Forms user interface.
 
-BatchQueueOrganizerLauncher/
+src/BatchQueueOrganizerLauncher/
     Small C# WinForms launcher used to provide a dedicated process, icon,
     taskbar entry, error reporting, and clean child-process shutdown.
 
-Build-BatchQueueOrganizerDistribution.ps1
+assets/
+    Application icon used by the launcher and the PowerShell interface.
+
+scripts/Build-Distribution.ps1
     Optional local script for creating the self-contained single-file EXE.
+
+docs/
+    Short Readme, PDF user guide, and release workflow instructions.
+
+.github/workflows/create-release.yml
+    Builds and creates a GitHub draft release when a v* tag is pushed.
 ```
 
 Generated `Organizer*.json` files and the `OrganizerQueueSets`, `OrganizerBackups`, `OrganizerMigrationArchive`, and `OrganizerDeletedMods` directories are user-specific application data and are intentionally excluded from source control. Compiled binaries, `bin`, `obj`, publish directories, and distribution archives are also ignored.
@@ -68,7 +77,7 @@ Supported local relationships are `Requires`, `LoadAfter`, `Incompatible`, and `
 Building is not required for reviewing the source code. To compile the launcher, install the .NET 9 SDK and run:
 
 ```powershell
-dotnet build .\BatchQueueOrganizerLauncher\BatchQueueOrganizerLauncher.csproj -c Release
+dotnet build .\src\BatchQueueOrganizerLauncher\BatchQueueOrganizerLauncher.csproj -c Release
 ```
 
 The normal framework-dependent launcher expects `BatchQueueOrganizer.ps1` next to the executable.
@@ -76,10 +85,14 @@ The normal framework-dependent launcher expects `BatchQueueOrganizer.ps1` next t
 To create the public self-contained single-file distribution used by the Nexus release, run:
 
 ```powershell
-.\Build-BatchQueueOrganizerDistribution.ps1
+.\scripts\Build-Distribution.ps1
 ```
 
 This embeds the PowerShell application and icon into the launcher and publishes a Windows x64 executable under `distribute`.
+
+## GitHub Release Workflow
+
+Pushing an annotated version tag such as `v1.1.1` starts the GitHub Actions workflow. It builds the self-contained EXE, validates the PowerShell source syntax, packages both the portable download and a structured source archive, then creates a **draft** GitHub release for manual review. The full Organizer self-test remains a local release check because it requires a valid ME3Tweaks installation. See [docs/RELEASE_WORKFLOW.md](docs/RELEASE_WORKFLOW.md) for the release checklist and commands.
 
 ## Why the Self-Contained EXE Is Much Larger
 
