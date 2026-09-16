@@ -4,7 +4,7 @@
     <TargetFramework>net9.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>BatchQueueOrganizer</AssemblyName>
-    <RootNamespace>ME3TweaksBatchQueueOrganizer</RootNamespace>
+    <RootNamespace>BatchQueueOrganizerForME3Tweaks</RootNamespace>
     <Version>1.1.0</Version>
     <AssemblyVersion>1.1.0.0</AssemblyVersion>
     <FileVersion>1.1.0.0</FileVersion>

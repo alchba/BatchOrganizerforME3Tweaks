@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Windows.Forms;
 
-namespace ME3TweaksBatchQueueOrganizer;
+namespace BatchQueueOrganizerForME3Tweaks;
 
 internal static class Program
 {
@@ -14,7 +14,7 @@ internal static class Program
     {
         string appDirectory = AppContext.BaseDirectory;
 #if DISTRIBUTION_BUILD
-        runtimeDirectory = Path.Combine(Path.GetTempPath(), $"ME3TweaksBatchQueueOrganizer-{Environment.ProcessId}");
+        runtimeDirectory = Path.Combine(Path.GetTempPath(), $"BatchQueueOrganizerForME3Tweaks-{Environment.ProcessId}");
         Directory.CreateDirectory(runtimeDirectory);
         string scriptPath = Path.Combine(runtimeDirectory, "BatchQueueOrganizer.ps1");
         string iconPath = Path.Combine(runtimeDirectory, "BatchQueueOrganizer.ico");

@@ -55,7 +55,7 @@ jobs:
           Compress-Archive -Path "$packageRoot\*" -DestinationPath $binaryArchive -CompressionLevel Optimal
 
           $sourceArchive = Join-Path $releaseRoot "BatchQueueOrganizer-Source-$tag.zip"
-          git archive --format=zip --prefix="BatchQueueOrganizer-Source/" --output=$sourceArchive $env:GITHUB_SHA
+          git archive --format=zip --prefix="BatchQueueOrganizerForME3Tweaks-Source/" --output=$sourceArchive $env:GITHUB_SHA
 
       - name: Create GitHub draft release
         uses: softprops/action-gh-release@v2
